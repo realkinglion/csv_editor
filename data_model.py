@@ -5,6 +5,7 @@ from PySide6.QtGui import QColor, QTextDocument
 from PySide6.QtWidgets import QMessageBox, QApplication
 import pandas as pd
 import re
+from collections import deque #
 
 class CsvTableModel(QAbstractTableModel):
     data_requested = Signal(list)
@@ -18,12 +19,16 @@ class CsvTableModel(QAbstractTableModel):
         self._app_instance = None
         self._search_highlight_indexes = set()
         self._current_search_index = QModelIndex()
+        self._row_cache = {}  # 行キャッシュ
+        self._cache_queue = deque(maxlen=1000)  # LRU用キュー
 
     def set_dataframe(self, dataframe):
         self.beginResetModel()
         self._dataframe = dataframe if dataframe is not None else pd.DataFrame()
         self._headers = list(self._dataframe.columns)
         self._backend = None
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         self.endResetModel()
 
     def set_header(self, headers):
@@ -38,6 +43,8 @@ class CsvTableModel(QAbstractTableModel):
         else:
             pass 
         self._dataframe = pd.DataFrame()
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         self.endResetModel()
 
     def set_app_instance(self, app_instance):
@@ -71,41 +78,91 @@ class CsvTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return len(self._headers)
 
+    # ▼▼▼【最終改善案】このメソッドを以下のように変更しました ▼▼▼
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid() or not self._theme: return None
+        if not index.isValid(): return None
         row, col = index.row(), index.column()
 
-        if role in (Qt.DisplayRole, Qt.EditRole):
+        # Qt.EditRoleは、セルを編集するときに呼ばれ、元の完全なデータを返す
+        if role == Qt.EditRole:
+            cell_content = None
             if self._backend:
                 try:
-                    df_row = self._backend.get_rows_by_ids([row]) 
-                    if not df_row.empty and col < len(self._headers):
+                    df_row = self._get_cached_row(row) # キャッシュを活用
+                    if not df_row.empty:
                         col_name = self.headerData(col, Qt.Horizontal)
                         if col_name in df_row.columns:
                             cell_content = df_row.loc[row, col_name]
-                            # ▼▼▼ 修正箇所 ▼▼▼
-                            # HTMLタグを保持するため、QTextDocumentによる除去処理を削除
-                            return str(cell_content)
+                except Exception as e:
+                    print(f"Error fetching data for edit at row {row}, col {col}: {e}"); return "ERROR"
+            elif self._dataframe is not None and 0 <= row < self._dataframe.shape[0] and 0 <= col < self.columnCount():
+                cell_content = self._dataframe.iloc[row, col]
+            
+            return str(cell_content) if cell_content is not None else ""
+
+        # Qt.DisplayRoleは、画面にセルを表示するときに呼ばれる
+        if role == Qt.DisplayRole:
+            cell_content = None
+            if self._backend:
+                try:
+                    df_row = self._get_cached_row(row) # キャッシュを活用
+                    if not df_row.empty:
+                        col_name = self.headerData(col, Qt.Horizontal)
+                        if col_name in df_row.columns:
+                            cell_content = df_row.loc[row, col_name]
                 except Exception as e:
                     print(f"Error fetching data from backend at row {row}, col {col}: {e}"); return "ERROR"
-                return ""
-            if self._dataframe is not None and 0 <= row < self._dataframe.shape[0] and 0 <= col < self.columnCount():
+            elif self._dataframe is not None and 0 <= row < self._dataframe.shape[0] and 0 <= col < self.columnCount():
                 cell_content = self._dataframe.iloc[row, col]
-                # ▼▼▼ 修正箇所 ▼▼▼
-                # HTMLタグを保持するため、QTextDocumentによる除去処理を削除
-                return str(cell_content)
-            return None
 
-        if role == Qt.BackgroundRole:
-            if self._app_instance and index in self._app_instance.pulsing_cells:
-                return self._theme.INFO_QCOLOR
-            if index == self._current_search_index: return QColor(self._theme.DANGER)
-            elif index in self._search_highlight_indexes: return QColor(self._theme.WARNING).lighter(150)
-            return self._theme.BG_LEVEL_0_QCOLOR if row % 2 == 0 else self._theme.BG_LEVEL_1_QCOLOR
+            content_str = str(cell_content) if cell_content is not None else ""
             
-        if role == Qt.ForegroundRole and index == self._current_search_index: return QColor("white")
+            # 【重要】表示専用に、長すぎる文字列を省略する
+            # これにより、巨大な文字列があっても描画がフリーズしなくなる
+            # 500文字以上の文字列は、先頭500文字と"..."で表示
+            if len(content_str) > 500:
+                return content_str[:500] + "..."
+            
+            return content_str
+        
+        # --- 背景色や文字色の処理（変更なし） ---
+        if self._theme:
+            if role == Qt.BackgroundRole:
+                if self._app_instance and index in self._app_instance.pulsing_cells:
+                    return self._theme.INFO_QCOLOR
+                if index == self._current_search_index: return QColor(self._theme.DANGER)
+                elif index in self._search_highlight_indexes: return QColor(self._theme.WARNING).lighter(150)
+                return self._theme.BG_LEVEL_0_QCOLOR if row % 2 == 0 else self._theme.BG_LEVEL_1_QCOLOR
+                
+            if role == Qt.ForegroundRole and index == self._current_search_index: return QColor("white")
         
         return None
+    # ▲▲▲【最終改善案】ここまでが変更箇所です ▲▲▲
+
+    def _get_cached_row(self, row_id): #
+        """LRUキャッシュから行データを取得。キャッシュミス時はバックエンドから取得し、キャッシュに追加。"""
+        if row_id in self._row_cache: #
+            # LRU更新のためキューから削除し、末尾に追加
+            try: #
+                self._cache_queue.remove(row_id) #
+            except ValueError: #
+                pass #
+            self._cache_queue.append(row_id) #
+            return self._row_cache[row_id] #
+            
+        # キャッシュミス時のみDBアクセス
+        df_row = self._backend.get_rows_by_ids([row_id]) #
+        
+        # キャッシュに保存（メモリ制限付き）
+        if len(self._cache_queue) >= self._cache_queue.maxlen: #
+            oldest = self._cache_queue.popleft() #
+            if oldest in self._row_cache: #
+                del self._row_cache[oldest] #
+        
+        # DataFrame.loc[row_id]はSeriesを返すので、DataFrameとして保存
+        self._row_cache[row_id] = df_row #
+        self._cache_queue.append(row_id) #
+        return df_row #
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole:
@@ -128,8 +185,15 @@ class CsvTableModel(QAbstractTableModel):
 
     def flags(self, index):
         if not index.isValid(): return Qt.NoItemFlags
-        if self._app_instance and self._app_instance.lazy_loader is not None:
-             return Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        
+        is_readonly = False
+        if self._app_instance:
+            if hasattr(self._app_instance, 'is_readonly_mode'):
+                is_readonly = self._app_instance.is_readonly_mode(for_edit=True)
+        
+        if is_readonly:
+            return Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            
         return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
 
     def setData(self, index, value, role=Qt.EditRole):
@@ -139,18 +203,19 @@ class CsvTableModel(QAbstractTableModel):
         row, col = index.row(), index.column()
         col_name = self.headerData(col, Qt.Horizontal)
 
-        # ▼▼▼ 修正箇所 ▼▼▼
         # HTMLをそのまま扱うため、QTextDocumentによるクリーンアップ処理は行わない
         # 渡された値をそのまま使用する
         plain_text_value = value
         
-        current_data = self.data(index, Qt.DisplayRole)
+        # 編集前のデータを取得 (DisplayRoleで省略されていない完全なデータを取得するため、EditRoleを使う)
+        current_data = self.data(index, Qt.EditRole)
         if str(current_data) == str(plain_text_value):
             return False
 
         if self._backend and hasattr(self._backend, 'update_cells'):
             change = [{'row_idx': row, 'col_name': col_name, 'new_value': plain_text_value}]
             self._backend.update_cells(change)
+            self._row_cache.pop(row, None) # キャッシュを無効化
             self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
             return True
         elif self._dataframe is not None:
@@ -179,30 +244,39 @@ class CsvTableModel(QAbstractTableModel):
                 new_col_names.append(final_col_name)
                 temp_headers.insert(column + i, final_col_name)
             
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            self._app_instance.progress_bar.setRange(0, self.rowCount())
-            self._app_instance.progress_bar.setValue(0)
-            self._app_instance.progress_bar.show()
-            self._app_instance.show_operation_status("列の挿入: テーブルを再構築中...", duration=0)
+            if self._app_instance:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                self._app_instance.progress_bar.setRange(0, self.rowCount())
+                self._app_instance.progress_bar.setValue(0)
+                self._app_instance.progress_bar.show()
+                self._app_instance.show_operation_status("列の挿入: テーブルを再構築中...", duration=0)
 
             try:
-                success = self._backend.recreate_table_with_new_columns(temp_headers, old_headers_current, 
-                                                                         progress_callback=lambda p: self._app_instance.progress_bar_update_signal.emit(p))
+                progress_signal = self._app_instance.progress_bar_update_signal if self._app_instance else None
+                success = self._backend.recreate_table_with_new_columns(
+                    temp_headers, old_headers_current, 
+                    progress_callback=lambda p: progress_signal.emit(p) if progress_signal else None
+                )
                 if success:
                     self.beginResetModel()
                     self._headers = temp_headers
                     self.endResetModel()
-                else:
+                    self._row_cache.clear() # キャッシュクリア
+                    self._cache_queue.clear() # キャッシュクリア
+                elif self._app_instance:
                     self.show_operation_status("列の挿入に失敗しました。", is_error=True)
                 
-                self._app_instance.progress_bar.hide()
-                QApplication.restoreOverrideCursor()
+                if self._app_instance:
+                    self._app_instance.progress_bar.hide()
+                    QApplication.restoreOverrideCursor()
                 return success
             except Exception as e:
-                self._app_instance.progress_bar.hide()
-                QApplication.restoreOverrideCursor()
+                if self._app_instance:
+                    self._app_instance.progress_bar.hide()
+                    QApplication.restoreOverrideCursor()
                 print(f"Error recreating table for insert columns: {e}")
-                self._app_instance.show_operation_status(f"列の挿入に失敗しました: {e}", is_error=True)
+                if self._app_instance:
+                    self._app_instance.show_operation_status(f"列の挿入に失敗しました: {e}", is_error=True)
                 return False
         
         self.beginInsertColumns(parent, column, column + count - 1)
@@ -218,6 +292,8 @@ class CsvTableModel(QAbstractTableModel):
             self._headers.insert(column + i, final_col_name)
             if self._dataframe is not None: self._dataframe.insert(column + i, final_col_name, "")
         self.endInsertColumns()
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         return True
 
     def removeColumns(self, column, count, parent=QModelIndex()):
@@ -229,28 +305,37 @@ class CsvTableModel(QAbstractTableModel):
             old_headers_current = list(self._headers)
             new_headers_after_delete = [h for h in old_headers_current if h not in cols_to_drop_names]
             
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            self._app_instance.progress_bar.setRange(0, self.rowCount())
-            self._app_instance.progress_bar.setValue(0)
-            self._app_instance.progress_bar.show()
-            self._app_instance.show_operation_status("列の削除: テーブルを再構築中...", duration=0)
+            if self._app_instance:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                self._app_instance.progress_bar.setRange(0, self.rowCount())
+                self._app_instance.progress_bar.setValue(0)
+                self._app_instance.progress_bar.show()
+                self._app_instance.show_operation_status("列の削除: テーブルを再構築中...", duration=0)
 
             try:
-                success = self._backend.recreate_table_with_new_columns(new_headers_after_delete, old_headers_current,
-                                                                         progress_callback=lambda p: self._app_instance.progress_bar_update_signal.emit(p))
+                progress_signal = self._app_instance.progress_bar_update_signal if self._app_instance else None
+                success = self._backend.recreate_table_with_new_columns(
+                    new_headers_after_delete, old_headers_current,
+                    progress_callback=lambda p: progress_signal.emit(p) if progress_signal else None
+                )
                 if success:
                     self.beginResetModel()
                     self._headers = new_headers_after_delete
                     self.endResetModel()
+                    self._row_cache.clear() # キャッシュクリア
+                    self._cache_queue.clear() # キャッシュクリア
 
-                self._app_instance.progress_bar.hide()
-                QApplication.restoreOverrideCursor()
+                if self._app_instance:
+                    self._app_instance.progress_bar.hide()
+                    QApplication.restoreOverrideCursor()
                 return success
             except Exception as e:
-                self._app_instance.progress_bar.hide()
-                QApplication.restoreOverrideCursor()
+                if self._app_instance:
+                    self._app_instance.progress_bar.hide()
+                    QApplication.restoreOverrideCursor()
                 print(f"Error recreating table for remove columns: {e}")
-                self._app_instance.show_operation_status(f"列の削除に失敗しました: {e}", is_error=True)
+                if self._app_instance:
+                    self._app_instance.show_operation_status(f"列の削除に失敗しました: {e}", is_error=True)
                 return False
         
         self.beginRemoveColumns(parent, column, column + count - 1)
@@ -258,6 +343,8 @@ class CsvTableModel(QAbstractTableModel):
             self._dataframe.drop(columns=cols_to_drop_names, inplace=True)
         del self._headers[column : column + count]
         self.endRemoveColumns()
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         return True
     
     def insertRows(self, row, count, parent=QModelIndex()):
@@ -271,6 +358,8 @@ class CsvTableModel(QAbstractTableModel):
                 self._dataframe = pd.concat([self._dataframe.iloc[:row + i], new_row_df, self._dataframe.iloc[row + i:]]).reset_index(drop=True)
 
         self.endInsertRows()
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         return True
 
     def removeRows(self, row, count, parent=QModelIndex()):
@@ -288,6 +377,8 @@ class CsvTableModel(QAbstractTableModel):
             self._dataframe.reset_index(drop=True, inplace=True)
         
         self.endRemoveRows()
+        self._row_cache.clear() # キャッシュクリア
+        self._cache_queue.clear() # キャッシュクリア
         return True
 
     def sort(self, column, order):
@@ -297,9 +388,12 @@ class CsvTableModel(QAbstractTableModel):
                 self._backend.set_sort_order(col_name, order)
                 self.beginResetModel()
                 self.endResetModel()
+                self._row_cache.clear() # キャッシュクリア
+                self._cache_queue.clear() # キャッシュクリア
         elif self._dataframe is not None:
             self.beginResetModel()
             if column == -1:
+                # ソートをリセット（元の順序に戻す）
                 self._dataframe.sort_index(inplace=True)
             else:
                 try:
@@ -308,7 +402,7 @@ class CsvTableModel(QAbstractTableModel):
                         by=col_name,
                         ascending=(order == Qt.AscendingOrder),
                         inplace=True,
-                        kind='mergesort'
+                        kind='mergesort' # 安定ソート
                     )
                 except Exception as e:
                     print(f"DataFrame sort error: {e}")
@@ -342,8 +436,10 @@ class CsvTableModel(QAbstractTableModel):
                 if hasattr(self._backend, 'get_all_indices'):
                     all_indices = self._backend.get_all_indices()
                     df = self._backend.get_rows_by_ids(all_indices)
+                    # ヘッダーの順序を保証する
                     return df[self._headers] if not df.empty and set(self._headers).issubset(df.columns) else df
                 elif hasattr(self._backend, 'get_total_rows'):
+                    # Fallback for older backend versions, might be slow
                     pass
             finally:
                 if self._app_instance: QApplication.restoreOverrideCursor()
@@ -353,9 +449,11 @@ class CsvTableModel(QAbstractTableModel):
     def get_rows_as_dataframe(self, row_indices: list[int]) -> pd.DataFrame:
         if not row_indices: return pd.DataFrame(columns=self._headers)
         if self._backend:
+            # get_rows_by_idsは既にキャッシュ機構を持つため、ここでは追加のキャッシュは不要
             if self._app_instance: QApplication.setOverrideCursor(Qt.WaitCursor)
             try: 
                 df = self._backend.get_rows_by_ids(row_indices)
+                # ヘッダーの順序を保証する
                 return df[self._headers] if not df.empty and set(self._headers).issubset(df.columns) else df
             finally:
                 if self._app_instance: QApplication.restoreOverrideCursor()
