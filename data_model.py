@@ -5,7 +5,8 @@ from PySide6.QtGui import QColor, QTextDocument
 from PySide6.QtWidgets import QMessageBox, QApplication
 import pandas as pd
 import re
-from collections import deque #
+from collections import deque
+
 
 class CsvTableModel(QAbstractTableModel):
     data_requested = Signal(list)
@@ -22,6 +23,72 @@ class CsvTableModel(QAbstractTableModel):
         self._row_cache = {}  # 行キャッシュ
         self._cache_queue = deque(maxlen=1000)  # LRU用キュー
 
+    def _safe_truncate_html(self, content_str, max_length=500):
+        """
+        HTMLタグを破損させない安全な文字列切り詰め
+        楽天市場の商品説明HTMLに対応
+        """
+        if not content_str or len(content_str) <= max_length:
+            return content_str
+
+        # HTMLタグが含まれているかチェック
+        has_html_tags = '<' in content_str and '>' in content_str
+        
+        if not has_html_tags:
+            # HTMLタグがない場合は単語境界で切り詰め
+            return self._truncate_at_word_boundary(content_str, max_length)
+
+        # HTMLタグがある場合の安全な処理
+        truncated = content_str[:max_length]
+        
+        # 最後の完全なHTMLタグの位置を見つける
+        last_complete_tag = truncated.rfind('>')
+        last_incomplete_tag = truncated.rfind('<')
+        
+        # 不完全なタグがある場合（< の後に > がない）
+        if last_incomplete_tag > last_complete_tag:
+            # 最後の完全なタグまで戻る
+            if last_complete_tag > max_length - 100:   # 100文字以内なら
+                return content_str[:last_complete_tag + 1] + "..."
+            else:
+                # 完全なタグが遠い場合は不完全タグの前で切る
+                return content_str[:last_incomplete_tag] + "..."
+        
+        # HTMLエンティティ(&amp; &lt; など)の保護
+        last_ampersand = truncated.rfind('&')
+        if last_ampersand > max_length - 10:   # エンティティは通常10文字以内
+            semicolon_pos = truncated.find(';', last_ampersand)
+            if semicolon_pos == -1:   # セミコロンが見つからない（不完全なエンティティ）
+                return content_str[:last_ampersand] + "..."
+        
+        return truncated + "..."
+
+    def _truncate_at_word_boundary(self, text, max_length):
+        """単語境界での切り詰め（日本語対応）"""
+        if len(text) <= max_length:
+            return text
+        
+        truncated = text[:max_length]
+        
+        # 日本語の句読点で区切る
+        japanese_punctuation = ['。', '、', '！', '？', '）', '】', '』']
+        best_pos = -1
+        
+        for punct in japanese_punctuation:
+            pos = truncated.rfind(punct)
+            if pos > max_length - 50:   # 50文字以内
+                best_pos = max(best_pos, pos)
+        
+        if best_pos > -1:
+            return text[:best_pos + 1] + "..."
+        
+        # 英語のスペースで区切る
+        last_space = truncated.rfind(' ')
+        if last_space > max_length - 50:
+            return text[:last_space] + "..."
+        
+        return truncated + "..."
+
     def set_dataframe(self, dataframe):
         self.beginResetModel()
         self._dataframe = dataframe if dataframe is not None else pd.DataFrame()
@@ -30,10 +97,6 @@ class CsvTableModel(QAbstractTableModel):
         self._row_cache.clear() # キャッシュクリア
         self._cache_queue.clear() # キャッシュクリア
         self.endResetModel()
-
-    def set_header(self, headers):
-        self._headers = headers
-        self.layoutChanged.emit()
 
     def set_backend(self, backend_instance):
         self.beginResetModel()
@@ -117,11 +180,9 @@ class CsvTableModel(QAbstractTableModel):
 
             content_str = str(cell_content) if cell_content is not None else ""
             
-            # 【重要】表示専用に、長すぎる文字列を省略する
-            # これにより、巨大な文字列があっても描画がフリーズしなくなる
-            # 500文字以上の文字列は、先頭500文字と"..."で表示
+            # 🔥 重要修正: HTMLタグを保護しながら安全に切り詰める
             if len(content_str) > 500:
-                return content_str[:500] + "..."
+                return self._safe_truncate_html(content_str, 500)
             
             return content_str
         
@@ -139,30 +200,30 @@ class CsvTableModel(QAbstractTableModel):
         return None
     # ▲▲▲【最終改善案】ここまでが変更箇所です ▲▲▲
 
-    def _get_cached_row(self, row_id): #
+    def _get_cached_row(self, row_id):
         """LRUキャッシュから行データを取得。キャッシュミス時はバックエンドから取得し、キャッシュに追加。"""
-        if row_id in self._row_cache: #
+        if row_id in self._row_cache:
             # LRU更新のためキューから削除し、末尾に追加
-            try: #
-                self._cache_queue.remove(row_id) #
-            except ValueError: #
-                pass #
-            self._cache_queue.append(row_id) #
-            return self._row_cache[row_id] #
+            try:
+                self._cache_queue.remove(row_id)
+            except ValueError:
+                pass
+            self._cache_queue.append(row_id)
+            return self._row_cache[row_id]
             
         # キャッシュミス時のみDBアクセス
-        df_row = self._backend.get_rows_by_ids([row_id]) #
+        df_row = self._backend.get_rows_by_ids([row_id])
         
         # キャッシュに保存（メモリ制限付き）
-        if len(self._cache_queue) >= self._cache_queue.maxlen: #
-            oldest = self._cache_queue.popleft() #
-            if oldest in self._row_cache: #
-                del self._row_cache[oldest] #
+        if len(self._cache_queue) >= self._cache_queue.maxlen:
+            oldest = self._cache_queue.popleft()
+            if oldest in self._row_cache:
+                del self._row_cache[oldest]
         
         # DataFrame.loc[row_id]はSeriesを返すので、DataFrameとして保存
-        self._row_cache[row_id] = df_row #
-        self._cache_queue.append(row_id) #
-        return df_row #
+        self._row_cache[row_id] = df_row
+        self._cache_queue.append(row_id)
+        return df_row
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if role == Qt.DisplayRole:
@@ -461,3 +522,10 @@ class CsvTableModel(QAbstractTableModel):
             valid_indices = [idx for idx in row_indices if 0 <= idx < len(self._dataframe)]
             return self._dataframe.iloc[valid_indices].copy()
         return pd.DataFrame(columns=self._headers)
+
+    # 🔥 追加: data_model.py に force_refresh メソッドを追加
+    def force_refresh(self):
+        """キャッシュをクリアして強制的に表示を更新"""
+        self._row_cache.clear()
+        self._cache_queue.clear()
+        self.layoutChanged.emit()

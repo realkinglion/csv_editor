@@ -31,6 +31,8 @@ class ViewController(QObject):
         self.main_window._set_ui_state('welcome')
         self.main_window.status_label.setText("ファイルを開いてください。")
         self.main_window.view_toggle_action.setEnabled(False)
+        # バックエンドが残っている場合を考慮してクリーンアップを要求
+        self.main_window.async_manager.cleanup_backend_requested.emit()
     
     def show_main_view(self):
         """メインビュー（テーブルまたはカード）を表示"""

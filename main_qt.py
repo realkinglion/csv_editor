@@ -13,11 +13,12 @@ from PySide6.QtWidgets import (
     QDataWidgetMapper
 )
 from PySide6.QtGui import QKeySequence, QGuiApplication, QTextOption, QFont, QAction, QPalette
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QModelIndex, QEvent, QItemSelectionModel, QObject, QItemSelection, QSize, QUrl # QUrlを追加
+# 🔥 修正: QPropertyAnimation のインポートを追加
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QModelIndex, QEvent, QItemSelectionModel, QObject, QItemSelection, QSize, QUrl, QPropertyAnimation
 
 import config
 import pandas as pd
-import os # osを追加
+import os
 import csv
 import re
 import traceback
@@ -52,6 +53,9 @@ from ui_main_window import Ui_MainWindow
 # 既存のimport文の後に追加
 from settings_manager import SettingsManager
 
+# ローディングオーバーレイのインポート
+from loading_overlay import LoadingOverlay
+
 
 class CsvEditorAppQt(QMainWindow):
     """
@@ -61,6 +65,12 @@ class CsvEditorAppQt(QMainWindow):
     data_fetched = Signal(pd.DataFrame)
     create_extract_window_signal = Signal(pd.DataFrame)
     progress_bar_update_signal = Signal(int)
+
+    # ファイル読み込み開始・進捗・終了シグナル
+    # AsyncDataManagerからemitされ、_show_loading_overlay等に接続
+    file_loading_started = Signal()
+    file_loading_progress = Signal(str, int, int)
+    file_loading_finished = Signal()
 
     def __init__(self, dataframe=None, parent=None, filepath=None, encoding='shift_jis'):
         super().__init__(parent)
@@ -180,7 +190,11 @@ class CsvEditorAppQt(QMainWindow):
         self.settings_manager = SettingsManager()
         
         self.operation_timer = None
-        self.progress_dialog = None
+        self.progress_dialog = None # 既存のQProgressDialogは引き続き使用
+
+        # ローディングオーバーレイの作成と初期非表示
+        self.loading_overlay = LoadingOverlay(self)
+        self.loading_overlay.hide()
         
         self.table_view.setModel(self.table_model)
         self.table_view.verticalHeader().setDefaultSectionSize(self.density['row_height'])
@@ -208,9 +222,10 @@ class CsvEditorAppQt(QMainWindow):
             self._set_ui_state('normal')
             self.view_controller.recreate_card_view_fields()
         else:
+            # 🔥 修正: ウェルカム画面を確実に表示
             self.view_stack.hide()
             self.welcome_widget.show()
-            self.view_controller.show_welcome_screen()
+            # view_controller.show_welcome_screen()は呼ばない（重複するため）
 
         self.settings_manager.load_window_settings(self)
 
@@ -303,7 +318,6 @@ class CsvEditorAppQt(QMainWindow):
         self.async_manager.replace_from_file_completed.connect(self._on_replace_from_file_completed)
         self.async_manager.product_discount_completed.connect(self._on_product_discount_completed)
 
-
     def _connect_signals(self):
         # QActionの接続
         self.new_action.triggered.connect(self.file_controller.create_new_file)
@@ -321,8 +335,8 @@ class CsvEditorAppQt(QMainWindow):
             self.sample_data_button_welcome.clicked.connect(self.test_data)
 
         self.async_manager.data_ready.connect(self._on_async_data_ready)
-        self.async_manager.task_progress.connect(self._update_progress_dialog)
-        
+        self.async_manager.task_progress.connect(self._update_progress_dialog) # 既存のQProgressDialogの更新
+
         self.create_extract_window_signal.connect(self._create_extract_window_in_ui_thread)
         self.pulse_timer.timeout.connect(self._end_pulse)
         self.progress_bar_update_signal.connect(lambda v: self.progress_bar.setValue(v))
@@ -380,6 +394,11 @@ class CsvEditorAppQt(QMainWindow):
         if hasattr(self, 'test_save_as_action'):
             self.test_save_as_action.triggered.connect(self._test_save_as_menu)
 
+        # ファイル読み込み専用ローディングシグナルとスロットの接続
+        self.file_loading_started.connect(self._show_loading_overlay)
+        self.file_loading_progress.connect(self._update_loading_progress)
+        self.file_loading_finished.connect(self._hide_loading_overlay)
+
     def _create_search_dock_widget(self):
         if self.search_dock_widget is None:
             self.search_dock_widget = QDockWidget("検索・置換・抽出", self)
@@ -400,6 +419,10 @@ class CsvEditorAppQt(QMainWindow):
             self.search_panel.product_discount_requested.connect(self._apply_product_discount)
 
     def _show_progress_dialog(self, title, on_cancel_slot):
+        """
+        既存のQProgressDialogを表示するメソッド。
+        主にファイル読み込み以外の、AsyncDataManagerからの進捗表示に使用。
+        """
         self._close_progress_dialog()
         self.progress_dialog = QProgressDialog(title, "キャンセル", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
@@ -421,6 +444,14 @@ class CsvEditorAppQt(QMainWindow):
 
     @Slot(str, int, int)
     def _update_progress_dialog(self, status, current, total):
+        """
+        既存のQProgressDialogの進捗を更新するメソッド。
+        AsyncDataManagerのtask_progressシグナルに接続される。
+        ファイル読み込み時以外（検索、分析、保存など）の進捗表示に使用。
+        """
+        # デバッグ出力を追加
+        print(f"DEBUG: Progress update (QProgressDialog) - Status: {status}, Current: {current}, Total: {total}")
+        
         if self.progress_dialog is None: return
         self.progress_dialog.setLabelText(status)
         if total == 0:
@@ -430,34 +461,121 @@ class CsvEditorAppQt(QMainWindow):
             if self.progress_dialog.maximum() != total:
                 self.progress_dialog.setMaximum(total)
             self.progress_dialog.setValue(current)
+        
+        # 100%完了時の処理を確実に、少し遅延して閉じる
         if current >= total and total > 0:
-            self._close_progress_dialog()
+            print("DEBUG: Progress 100% - closing dialog")
+            QTimer.singleShot(100, self._close_progress_dialog) # 少し遅延して確実に閉じる
         QApplication.processEvents()
 
     def _close_progress_dialog(self):
-        if self.progress_dialog:
-            self.progress_dialog.close()
-            self.progress_dialog = None
+        """
+        既存のQProgressDialogを閉じるメソッド。
+        AsyncDataManagerからのclose_progress_requestedシグナルに接続される。
+        """
+        # 🔥 修正: ローディングオーバーレイを閉じる際に堅牢なチェックを追加
+        if hasattr(self, 'loading_overlay') and self.loading_overlay is not None:
+            try:
+                self.loading_overlay.hide()
+            except Exception as e:
+                print(f"Warning: ローディングオーバーレイ非表示エラー: {e}")
+        
+        # プログレスダイアログを閉じる
+        if hasattr(self, 'progress_dialog') and self.progress_dialog is not None:
+            try:
+                self.progress_dialog.close()
+                self.progress_dialog = None
+            except Exception as e:
+                print(f"Warning: プログレスダイアログクローズエラー: {e}")
             
+    @Slot()
+    def _show_loading_overlay(self):
+        """
+        ローディングオーバーレイを表示する（ファイル読み込み専用）。
+        file_loading_startedシグナルに接続。
+        """
+        self.loading_overlay.resize(self.size())
+        self.loading_overlay.raise_()
+        self.loading_overlay.show()
+        QApplication.processEvents()
+    
+    @Slot()
+    def _hide_loading_overlay(self):
+        """
+        ローディングオーバーレイを非表示にする（ファイル読み込み専用）。
+        file_loading_finishedシグナルに接続。
+        """
+        # オーバーレイが存在しない、または非表示の場合は何もしない
+        if not hasattr(self, 'loading_overlay') or not self.loading_overlay.isVisible():
+            return
+        
+        try:
+            # フェードアウトアニメーション
+            fade_out = QPropertyAnimation(self.loading_overlay, b"windowOpacity")
+            fade_out.setDuration(300)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.0)
+            fade_out.finished.connect(self.loading_overlay.hide)
+            fade_out.start()
+        # アニメーションが失敗した場合は直接非表示
+        except Exception as e:
+            print(f"Warning: フェードアウトアニメーションエラー: {e}")
+            self.loading_overlay.hide()
+    
+    @Slot(str, int, int)
+    def _update_loading_progress(self, status, current, total):
+        """
+        ローディングオーバーレイの進捗を更新する（ファイル読み込み専用）。
+        file_loading_progressシグナルに接続。
+        """
+        # デバッグ出力を追加
+        print(f"DEBUG: Progress update (LoadingOverlay) - Status: {status}, Current: {current}, Total: {total}")
+        
+        self.loading_overlay.set_status(status)
+        if total > 0:
+            self.loading_overlay.show_progress(True)
+            self.loading_overlay.set_progress(current, total)
+        else: # totalが0の場合（不定プログレス）
+            self.loading_overlay.show_progress(False) # プログレスバーは非表示にし、スピナーのみ表示
+
     @Slot(object, str, str)
     def _on_file_loaded(self, data_object, filepath, encoding):
+        """
+        file_io_controller.file_loadedシグナルから呼び出される。
+        データの読み込みとモデルへの設定、UIの初期化を行う。
+        """
         print(f"DEBUG: _on_file_loaded: ファイル読み込み完了: {filepath}")
+        
+        # ローディング画面を確実に閉じる (AsyncDataManagerからのfile_loading_finishedと連携)
+        if hasattr(self, 'loading_overlay'):
+            self.loading_overlay.hide()
         
         if isinstance(data_object, pd.DataFrame):
             self._df = data_object
             self.table_model.set_dataframe(data_object)
             self.performance_mode = False
             total_rows = len(data_object)
-        else:
+        else: # LazyLoader or SQLiteBackend
             self.table_model.set_backend(data_object)
             self.performance_mode = True
             total_rows = data_object.get_total_rows()
+            
+            # 🔥 追加: バックエンドインスタンスを保存
+            if hasattr(data_object, 'table_name'):  # SQLiteBackend
+                self.db_backend = data_object
+                self.lazy_loader = None # SQLite使用時はLazyLoaderをクリア
+            else:  # LazyCSVLoader (hasattr(data_object, 'header') で識別も可)
+                self.lazy_loader = data_object
+                self.db_backend = None # LazyLoader使用時はSQLiteBackendをクリア
 
         self.filepath = filepath
         self.encoding = encoding
         self.header = list(data_object.columns) if isinstance(data_object, pd.DataFrame) else data_object.header
         
         self._set_ui_state('normal')
+        
+        # 🔥 修正: ビューを表示する前に確実にウェルカム画面を非表示
+        self.welcome_widget.hide()
         self.view_controller.show_main_view()
         
         status_text = f"{os.path.basename(filepath)} ({total_rows:,}行, {len(self.header)}列, {encoding})"
@@ -471,8 +589,15 @@ class CsvEditorAppQt(QMainWindow):
         
         self._clear_sort()
         
-        self.table_view.resizeColumnsToContents()
+        # 🔥 修正: 列幅の自動調整（大量列の場合は制限）
+        if self.table_model.columnCount() < 50:
+            self.table_view.resizeColumnsToContents()
+        else:
+            # 最初の10列のみ調整
+            for i in range(min(10, self.table_model.columnCount())):
+                self.table_view.resizeColumnToContents(i)
         
+        # 最初のセルを選択
         if self.table_model.rowCount() > 0 and self.table_model.columnCount() > 0:
             first_index = self.table_model.index(0, 0)
             self.table_view.setCurrentIndex(first_index)
@@ -510,13 +635,21 @@ class CsvEditorAppQt(QMainWindow):
     def _on_extract_completed(self, df):
         print(f"DEBUG: _on_extract_completed: 抽出完了: {df.shape if df is not None else 'None'}")
 
-
     @Slot(pd.DataFrame)
     def _on_async_data_ready(self, df):
+        """
+        AsyncDataManagerからデータが準備完了したときに呼び出される。
+        ファイル読み込み時のnormal modeでの最終処理、またはその他のデータ操作完了時に使用。
+        """
         print(f"WARNING: _on_async_data_ready が呼ばれました（AsyncDataManagerからの直接データ受信）")
         print(f"DEBUG: DataFrame shape: {df.shape if df is not None else 'None'}")
-        self._close_progress_dialog()
-        self.progress_bar.hide()
+        
+        # ローディング画面と既存のプログレスダイアログを確実に閉じる
+        self._close_progress_dialog() # QProgressDialogを閉じる
+        # LoadingOverlayがもし表示中なら (ファイル読み込みパスはfile_loading_finishedで閉じるのが主)
+        if hasattr(self, 'loading_overlay') and self.loading_overlay.isVisible():
+            self.loading_overlay.hide()
+        self.progress_bar.hide() # ツールバーのプログレスバーを隠す
         
         if hasattr(self.async_manager, 'is_cancelled') and self.async_manager.is_cancelled:
             self.show_operation_status("操作がキャンセルされました。", 3000)
@@ -531,20 +664,28 @@ class CsvEditorAppQt(QMainWindow):
             self.view_controller.show_welcome_screen()
             return
 
+        # AsyncDataManagerのload_full_dataframe_asyncから呼ばれる場合、
+        # このメソッドは `file_loaded` が emit された後に呼ばれるため、
+        # ここでのデータ設定やUI状態更新は重複または不適切になる可能性がある。
+        # _on_file_loaded で一元管理されるべき。
+        # ただし、AsyncDataManager.data_ready がファイル読み込み以外の用途（例: 変換処理後のDataFrame更新）でも使われる可能性があるため、
+        # ここでは既存のロジックは残しつつ、ファイル読み込みの主要なパスは `_on_file_loaded` に委譲されていることを前提とする。
+        
         load_mode = self.async_manager.current_load_mode
         self.performance_mode = (load_mode == 'sqlite' or load_mode == 'lazy')
 
-        if load_mode == 'sqlite':
+        # AsyncDataManagerがbackend_instanceを設定している場合はそれを使う
+        if load_mode == 'sqlite' and self.async_manager.backend_instance:
             self.db_backend = self.async_manager.get_backend_instance()
             self.table_model.set_backend(self.db_backend)
             self.header = self.db_backend.header
             total_rows = self.db_backend.get_total_rows()
-        elif load_mode == 'lazy':
+        elif load_mode == 'lazy' and self.async_manager.backend_instance:
             self.lazy_loader = self.async_manager.get_backend_instance()
             self.table_model.set_backend(self.lazy_loader)
             self.header = self.lazy_loader.header
             total_rows = self.lazy_loader.get_total_rows()
-        else:
+        elif load_mode == 'normal': # normal mode (AsyncDataManagerがnormal modeのファイルを読み込んだ場合)
             self._df = df
             self.table_model.set_dataframe(df)
             self.header = list(df.columns) if df is not None else []
@@ -556,8 +697,11 @@ class CsvEditorAppQt(QMainWindow):
         self.view_controller.recreate_card_view_fields()
         self._clear_sort()
         
-        current_filepath = self.async_manager.current_filepath if hasattr(self.async_manager, 'current_filepath') else "不明なファイル"
-        current_encoding = self.async_manager.current_encoding if hasattr(self.async_manager, 'current_encoding') else "不明"
+        # _on_file_loaded 経由のパスでは既にファイルパスが設定されているが、
+        # AsyncDataManagerが直接data_readyをemitするパス（例: 後処理でDFが返される場合）
+        # のために、ここでは念のためファイルパスとエンコーディングを更新するロジックを残す。
+        current_filepath = self.async_manager.current_filepath if hasattr(self.async_manager, 'current_filepath') else self.filepath or "不明なファイル"
+        current_encoding = self.async_manager.current_encoding if hasattr(self.async_manager, 'current_encoding') else self.encoding or "不明"
         
         self.filepath = current_filepath
         self.encoding = current_encoding
@@ -568,8 +712,9 @@ class CsvEditorAppQt(QMainWindow):
         
         self._set_ui_state('normal')
         self.view_controller.show_main_view()
-        self.table_view.resizeColumnsToContents()
+        # self.table_view.resizeColumnsToContents() # ここでの自動調整はUXをブロックするため、基本的にAsyncDataManager内で制御すべき
         print("DEBUG: _on_async_data_ready finished.")
+
 
     def test_data(self):
         """サンプルデータを作成して表示する"""
@@ -725,7 +870,6 @@ class CsvEditorAppQt(QMainWindow):
         self.operation_timer.timeout.connect(lambda: self.operation_label.setText(""))
         self.operation_timer.start(duration)
 
-    @Slot(pd.DataFrame)
     def _create_extract_window_in_ui_thread(self, df):
         """抽出結果を新しいウィンドウで表示"""
         print(f"DEBUG: 新しいウィンドウを作成 - DataFrame shape: {df.shape}")
@@ -745,7 +889,16 @@ class CsvEditorAppQt(QMainWindow):
             encoding=parent_encoding
         )
         self.open_windows.append(new_window)
+        
+        # 🔥 重要: ウィンドウを表示する前に、ビューを強制的に表示
+        new_window.view_stack.show()
+        new_window.welcome_widget.hide()
+        new_window.table_view.show()
+        
         new_window.show()
+        
+        # 🔥 追加: ビューの更新を強制
+        QApplication.processEvents()
         
         print(f"DEBUG: 新しいウィンドウが作成されました - エンコーディング: {new_window.encoding}")
 
@@ -1782,8 +1935,8 @@ class CsvEditorAppQt(QMainWindow):
     @Slot(str)
     def _on_parent_child_analysis_ready(self, summary_text):
         """親子関係分析結果の受信処理"""
-        self._close_progress_dialog()
-        self.progress_bar.hide()
+        self._close_progress_dialog() # AsyncDataManagerのtask_progressに接続されているQProgressDialogを閉じる
+        self.progress_bar.hide() # ツールバーのプログレスバーを隠す
         
         if self.search_panel:
             if "分析エラー" in summary_text:
@@ -1796,9 +1949,9 @@ class CsvEditorAppQt(QMainWindow):
     @Slot(list, str)
     def _on_replace_from_file_completed(self, changes: list, status_message: str):
         """ファイル参照置換完了の処理"""
-        self._close_progress_dialog()
+        self._close_progress_dialog() # QProgressDialogを閉じる
         QApplication.restoreOverrideCursor()
-        self.progress_bar.hide()
+        self.progress_bar.hide() # ツールバーのプログ्रेसバーを隠す
 
         if "エラー" in status_message or "失敗" in status_message:
             self.show_operation_status(status_message, is_error=True)
@@ -1816,9 +1969,9 @@ class CsvEditorAppQt(QMainWindow):
     @Slot(list, str)
     def _on_product_discount_completed(self, changes: list, status_message: str):
         """商品別割引適用完了の処理"""
-        self._close_progress_dialog()
+        self._close_progress_dialog() # QProgressDialogを閉じる
         QApplication.restoreOverrideCursor()
-        self.progress_bar.hide()
+        self.progress_bar.hide() # ツールバーのプログレスバーを隠す
         
         if "エラー" in status_message:
             self.show_operation_status(status_message, is_error=True)
@@ -1832,13 +1985,7 @@ class CsvEditorAppQt(QMainWindow):
             undo_data = []
             for change in changes:
                 # changes の要素は {row_idx, col_name, new_value} または {item, column, old, new}
-                # ここでは {item, column, old, new} 形式に統一する必要がある
-                # ProductDiscountTaskからは changes が {row_idx, col_name, new_value} 形式で返るため、old_valueが必要
-                # 一旦、ProductDiscountTask で old_value も返すように修正するか、
-                # ここで再度 old_value を取得する
-                # 今回は main_qt.py で old_value を取得するロジックを簡素化するため、
-                # features.py の ProductDiscountTask._process_with_dataframe/_process_with_backend で
-                # changes リストに 'old' を含めるように変更しました。
+                # ProductDiscountTaskからは changes が {row_idx, col_name, new_value, old_value} 形式で返る
                 undo_data.append({
                     'item': str(change['row_idx']) if 'row_idx' in change else change['item'],
                     'column': change['col_name'] if 'col_name' in change else change['column'],
@@ -1846,9 +1993,8 @@ class CsvEditorAppQt(QMainWindow):
                     'new': change['new_value'] if 'new_value' in change else change['new']
                 })
 
-            action = {'type': 'edit', 'data': undo_data} # 修正: undo_data を渡す
+            action = {'type': 'edit', 'data': undo_data}
             self.undo_manager.add_action(action)
-            # apply_action は db_backend の場合は内部で update_cells を呼ぶ
             self.apply_action(action, is_undo=False)
             self.show_operation_status(status_message)
 
@@ -1867,7 +2013,7 @@ class CsvEditorAppQt(QMainWindow):
             self.show_operation_status("このモードでは商品別割引適用を実行できません。", 3000, is_error=True)
             return
             
-        if not params['current_product_col'] or not params['current_price_col']:
+        if not params['current_product_col'] or not params['current_product_col'] in self.header:
             self.show_operation_status("現在ファイルの商品番号列と金額列を選択してください。", is_error=True)
             return
         
@@ -1875,7 +2021,7 @@ class CsvEditorAppQt(QMainWindow):
             self.show_operation_status("参照ファイルを選択してください。", is_error=True)
             return
         
-        if not params['ref_product_col'] or not params['ref_discount_col']:
+        if not params['ref_product_col'] or not self.search_panel.ref_product_col_combo.currentText():
             self.show_operation_status("参照ファイルの商品番号列と割引率列を選択してください。", is_error=True)
             return
         
@@ -1946,9 +2092,6 @@ class CsvEditorAppQt(QMainWindow):
 
     def _recreate_card_view_fields(self):
         self.view_controller.recreate_card_view_fields()
-
-    def _show_card_view(self, row_idx_in_model):
-        self.view_controller._show_card_view(row_idx_in_model)
 
     def _handle_card_view_tab_navigation(self, event: QEvent):
         return False
@@ -2021,7 +2164,19 @@ class CsvEditorAppQt(QMainWindow):
                     changes_for_db.append({'row_idx': row_idx, 'col_name': col_name, 'new_value': new_value})
 
                 self.db_backend.update_cells(changes_for_db)
-                self.table_model.layoutChanged.emit() # モデルが変更されたことを通知
+                
+                # 🔥 重要: キャッシュをクリアしてビューを更新
+                self.table_model._row_cache.clear()
+                self.table_model._cache_queue.clear()
+                
+                # より強力な更新方法
+                self.table_model.beginResetModel()
+                self.table_model.endResetModel()
+                
+                # カードビューが表示されている場合は更新
+                if self.card_scroll_area.isVisible():
+                    current_row = self.card_mapper.currentIndex()
+                    self.card_mapper.setCurrentIndex(current_row)
             else:
                 for change in data:
                     try:

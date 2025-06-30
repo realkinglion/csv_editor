@@ -4,14 +4,14 @@ import os
 import csv
 import pandas as pd
 import traceback
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QApplication, QProgressDialog, QDialog, QVBoxLayout, QRadioButton, QPushButton, QLabel, QDialogButtonBox, QInputDialog # QInputDialogを追加
-from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QApplication, QProgressDialog, QDialog, QVBoxLayout, QRadioButton, QPushButton, QLabel, QDialogButtonBox, QInputDialog
+from PySide6.QtCore import QObject, Signal, Qt, QTimer
 
-# ファイル冒頭のインポート部分（9行目の後に追加）
 import config
-from dialogs import EncodingSaveDialog, CSVSaveFormatDialog, NewFileDialog # NewFileDialogを追加
+from dialogs import EncodingSaveDialog, CSVSaveFormatDialog, NewFileDialog
 import re
-import psutil # 追加: メモリチェック用
+import psutil
+from threading import Thread
 
 
 class FileIOController(QObject):
@@ -44,33 +44,53 @@ class FileIOController(QObject):
             filepath = filepath_tuple[0]
         
         # 既存のバックエンドをクリーンアップ
-        self.main_window._cleanup_backend() 
+        self.main_window._cleanup_backend()
         
-        progress = None # プログレスダイアログは各モード内で管理される
-        data_object = None
-        
+        # AsyncDataManagerにファイル読み込みを委譲する前の初期進捗通知
+        # ローディング開始を通知（UIスレッドで即座に実行）
+        self.main_window.file_loading_started.emit()
+
+        # ファイル読み込みプロセスを非同期で開始
+        QTimer.singleShot(50, lambda: self._start_file_loading_process(filepath))
+    
+    # ファイル読み込みプロセスを開始するラッパーメソッド
+    def _start_file_loading_process(self, filepath):
+        # UIスレッドをブロックしないように、ここでの重い処理はAsyncDataManagerに委譲
+
         try:
-            # ファイルサイズチェック
+            # エンコーディング検出の進捗通知
+            self.main_window.file_loading_progress.emit(
+                "エンコーディングを検出中...", 0, 3
+            )
+            encoding = self._detect_encoding(filepath)
+            if not encoding:
+                # エラーメッセージはUIスレッドで安全に表示
+                QTimer.singleShot(0, lambda: QMessageBox.critical(self.main_window, "エラー",
+                                   "ファイルのエンコーディングを検出できませんでした。"))
+                QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
+                self.main_window.file_loading_finished.emit()
+                self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+                return None
+
+            # ファイルサイズチェックの進捗通知
+            self.main_window.file_loading_progress.emit(
+                "ファイルサイズを確認中...", 1, 3
+            )
             file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
             print(f"DEBUG: ファイルパス: {filepath}")
             print(f"DEBUG: ファイルサイズ: {file_size_mb:.2f} MB")
             
-            # エンコーディング検出
-            encoding = self._detect_encoding(filepath)
-            if not encoding:
-                QMessageBox.critical(self.main_window, "エラー", 
-                                   "ファイルのエンコーディングを検出できませんでした。")
-                self.main_window.view_controller.show_welcome_screen()
-                return None
-            
-            # ファイルサイズに基づく読み込みモード選択と直接処理
-            selected_mode = 'normal' # デフォルトは通常モード
-            
             # メモリ使用量とファイルサイズの事前チェック
             memory_ok, memory_msg = self._check_memory_feasibility(file_size_mb)
 
-            if file_size_mb > config.PERFORMANCE_MODE_THRESHOLD / 1000: # configの値を使用し、MBに変換
-                # 閾値を超えた場合、モード選択ダイアログを表示
+            selected_mode = 'normal' # デフォルトは通常モード
+
+            # 🔥 修正: 小さいファイルはモード選択ダイアログをスキップして直接非同期読み込みを開始
+            if file_size_mb <= config.PERFORMANCE_MODE_THRESHOLD / 1000:
+                print(f"DEBUG: 小さいファイル({file_size_mb:.2f}MB)のため通常モードで直接読み込み")
+                selected_mode = 'normal' # 小さいファイルは強制的に通常モード
+            else:
+                # 閾値を超えた場合、モード選択ダイアログを表示（UIスレッドで同期的に実行）
                 mode_dialog = QDialog(self.main_window)
                 mode_dialog.setWindowTitle("読み込みモード選択")
                 layout = QVBoxLayout(mode_dialog)
@@ -86,9 +106,9 @@ class FileIOController(QObject):
                 # ファイルサイズに応じたデフォルト選択
                 if file_size_mb > 100 or not memory_ok: # 100MB以上またはメモリ不足の場合はSQLiteを推奨
                     sqlite_radio.setChecked(True)
-                    if not memory_ok: #
-                        QMessageBox.warning(self.main_window, "メモリ不足", #
-                                            f"{memory_msg}\nSQLiteモードを推奨します。") #
+                    if not memory_ok:
+                        QMessageBox.warning(self.main_window, "メモリ不足",
+                                            f"{memory_msg}\nSQLiteモードを推奨します。")
                 else: # 閾値超～100MB未満は通常モードをデフォルト
                     normal_radio.setChecked(True)
                     
@@ -109,136 +129,86 @@ class FileIOController(QObject):
                     else:
                         selected_mode = 'normal'
                 else:
+                    # 🔥 修正: キャンセル時の処理
                     self.main_window.show_operation_status("ファイルの読み込みをキャンセルしました。", 3000)
-                    self.main_window.view_controller.show_welcome_screen()
+                    # プログレスダイアログが表示されている場合は閉じる
+                    if hasattr(self.main_window, 'progress_dialog') and self.main_window.progress_dialog is not None:
+                        self.main_window._close_progress_dialog()
+                    # ローディングオーバーレイも閉じる
+                    if hasattr(self.main_window, 'loading_overlay') and self.main_window.loading_overlay.isVisible():
+                        self.main_window.loading_overlay.hide()
+                    self.main_window.view_controller.show_welcome_screen() # ウェルカム画面に戻る
+                    self.main_window.async_manager.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
                     return None
             
             self.current_load_mode = selected_mode
             self.load_mode_changed.emit(self.current_load_mode) # シグナルを発行
 
-            if selected_mode == 'sqlite':
-                from db_backend import SQLiteBackend
-                
-                progress = QProgressDialog(
-                    f"「{os.path.basename(filepath)}」をデータベースに読み込み中...",
-                    "キャンセル",
-                    0, 0,
-                    self.main_window
-                )
-                progress.setWindowModality(Qt.WindowModal)
-                progress.setMinimumDuration(0)
-                progress.show()
-                QApplication.processEvents() # UI更新を強制
-                
-                try:
-                    backend = SQLiteBackend(self.main_window)
-                    
-                    def progress_callback(status, current, total):
-                        self.main_window._update_progress_dialog(status, current, total) # UI更新を強制
-                        return not progress.wasCanceled() # キャンセルされたらFalseを返す
-                        
-                    # 🔥 修正: 引数を正しく指定
-                    columns, total_rows = backend.import_csv_with_progress(
-                        filepath=filepath,
-                        encoding=encoding,
-                        delimiter=',',  # CSVのデフォルトデリミタ
-                        progress_callback=progress_callback
-                    )
-                    
-                    progress.close()
-                    
-                    if columns:
-                        backend.header = columns
-                        backend.total_rows = total_rows # 総行数を設定
-                        # バックエンドインスタンスを保存
-                        self.main_window.db_backend = backend
-                        self.main_window.async_manager.backend_instance = backend
-                        self.file_loaded.emit(backend, filepath, encoding)
-                        return backend
-                    else:
-                        # キャンセルされた場合やインポート失敗
-                        backend.close()
-                        self.main_window.show_operation_status("SQLiteへの読み込みがキャンセルされたか、失敗しました。", 3000)
-                        self.main_window.view_controller.show_welcome_screen()
-                        return None
-                        
-                except Exception as e:
-                    if progress:
-                        progress.close()
-                    if 'backend' in locals(): # backend変数が定義されていることを確認
-                        backend.close() # エラー時もクリーンアップ
-                    raise e # 外側のtry-exceptで捕捉
-
-            elif selected_mode == 'lazy':
-                from lazy_loader import LazyCSVLoader
-                loader = LazyCSVLoader(filepath, encoding)
-                self.file_loaded.emit(loader, filepath, encoding)
-                return loader
-
-            else: # selected_mode == 'normal' (または20MB以下のファイル)
-                progress = QProgressDialog( # 通常モードでもプログレスダイアログを表示
-                    f"「{os.path.basename(filepath)}」をメモリに読み込み中...",
-                    "キャンセル", 0, 0, self.main_window
-                )
-                progress.setWindowModality(Qt.WindowModal)
-                progress.setMinimumDuration(0)
-                progress.show()
-                QApplication.processEvents()
-
-                if progress.wasCanceled():
-                    self.main_window.show_operation_status("ファイルの読み込みをキャンセルしました。", 3000)
-                    self.main_window.view_controller.show_welcome_screen()
-                    return None
-                
-                data_object = self._load_file_data(filepath, encoding)
-                progress.close() # 読み込み完了後に閉じる
-
-                if data_object is not None:
-                    self.file_loaded.emit(data_object, filepath, encoding)
-                return data_object
+            # AsyncDataManager経由でのファイル読み込みを開始
+            self.main_window.async_manager.load_full_dataframe_async(
+                filepath, encoding, selected_mode # selected_mode を渡す
+            )
             
         except pd.errors.ParserError as e:
             print(f"ERROR: CSV解析エラー: {e}")
-            QMessageBox.critical(
-                self.main_window, 
-                "CSV解析エラー", 
+            QTimer.singleShot(0, lambda: QMessageBox.critical(
+                self.main_window,
+                "CSV解析エラー",
                 f"CSVファイルの解析中にエラーが発生しました。\n\n"
                 f"ファイルが正しいCSV形式であることを確認してください。\n\n"
                 f"詳細: {str(e)[:200]}..."
-            )
-            self.main_window.view_controller.show_welcome_screen()
+            ))
+            QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
+            self.main_window.file_loading_finished.emit()
+            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
         except MemoryError:
             print("ERROR: メモリ不足")
-            QMessageBox.critical(
-                self.main_window, 
-                "メモリ不足", 
+            QTimer.singleShot(0, lambda: QMessageBox.critical(
+                self.main_window,
+                "メモリ不足",
                 "ファイルが大きすぎてメモリに読み込めません。\n"
                 "より小さいファイルを使用するか、システムのメモリを増やしてください。"
-            )
-            self.main_window.view_controller.show_welcome_screen()
+            ))
+            QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
+            self.main_window.file_loading_finished.emit()
+            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
         except Exception as e:
             print(f"ERROR: 予期しないファイル読み込みエラー: {e}")
             print(f"スタックトレース:\n{traceback.format_exc()}")
+            # 🔥 修正: エラー時もプログレスダイアログとオーバーレイを閉じる
+            if hasattr(self.main_window, 'progress_dialog') and self.main_window.progress_dialog is not None:
+                self.main_window._close_progress_dialog()
+            if hasattr(self.main_window, 'loading_overlay') and self.main_window.loading_overlay.isVisible():
+                self.main_window.loading_overlay.hide()
+
             QMessageBox.critical(
-                self.main_window, 
-                "ファイル読み込みエラー", 
+                self.main_window,
+                "ファイル読み込みエラー",
                 f"ファイルの読み込み中に予期しないエラーが発生しました。\n\n{str(e)}"
             )
-            self.main_window.view_controller.show_welcome_screen()
+            QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
+            self.main_window.file_loading_finished.emit()
+            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
         finally:
-            # 各モードの処理ブロックで責任を持ってprogressを閉じるため、ここでは不要
-            pass 
+            pass # AsyncDataManagerが終了を通知するため、ここでは特に処理は不要
         
         return None
 
-    def _check_memory_feasibility(self, file_size_mb): #
-        """メモリ容量の事前チェック""" #
-        available_memory_mb = psutil.virtual_memory().available / (1024 * 1024) #
+    # --- 以下のメソッドは AsyncDataManager にロジックが統合されたため削除 ---
+    # def _load_normal_file_with_progress(self, filepath, encoding):
+    #     pass
+
+    # def _finalize_file_load(self, data_object, filepath, encoding):
+    #     pass
+
+    def _check_memory_feasibility(self, file_size_mb):
+        """メモリ容量の事前チェック"""
+        available_memory_mb = psutil.virtual_memory().available / (1024 * 1024)
         estimated_memory_mb = file_size_mb * 3  # CSV→DataFrame変換での膨張率
         
-        if estimated_memory_mb > available_memory_mb * 0.7: #
-            return False, f"必要メモリ: {estimated_memory_mb:.1f}MB, 利用可能: {available_memory_mb:.1f}MB" #
-        return True, "" #
+        if estimated_memory_mb > available_memory_mb * 0.7:
+            return False, f"必要メモリ: {estimated_memory_mb:.1f}MB, 利用可能: {available_memory_mb:.1f}MB"
+        return True, ""
     
     def save_file(self, filepath=None, is_save_as=True):
         """ファイルを保存"""
@@ -277,7 +247,7 @@ class FileIOController(QObject):
         
         if success:
             self.file_saved.emit(save_filepath)
-            pass 
+            pass
             
         return success
     
@@ -295,7 +265,7 @@ class FileIOController(QObject):
         if self.main_window.table_model.rowCount() > 0:
             if self.main_window.undo_manager.can_undo():
                 reply = QMessageBox.question(
-                    self.main_window, 
+                    self.main_window,
                     "確認",
                     "未保存の変更があります。新規作成を続行しますか？",
                     QMessageBox.Yes | QMessageBox.No,
@@ -365,7 +335,12 @@ class FileIOController(QObject):
             self.main_window.table_view.scrollTo(first_index)
             
     def _load_file_data(self, filepath, encoding):
-        """楽天CSV対応のファイル読み込み処理 (通常モード用)"""
+        """
+        楽天CSV対応のファイル読み込み処理 (通常モード用)
+        このメソッドは AsyncDataManager にロジックが統合されたため、
+        現在のコードベースではほぼ使用されないか、最終的に削除されるべきです。
+        ここでは変更せず残します。
+        """
         read_options = config.CSV_READ_OPTIONS.copy()
         read_options['encoding'] = encoding
         
@@ -400,10 +375,10 @@ class FileIOController(QObject):
         """エンコーディングを検出"""
         # config.py の CSV_READ_OPTIONS['encoding'] を参照してデフォルトのエンコーディングリストを構築
         encodings_to_try = [
-            'shift_jis', 
-            'cp932', 
-            'utf-8-sig', 
-            'utf-8', 
+            'shift_jis',
+            'cp932',
+            'utf-8-sig',
+            'utf-8',
             'euc-jp'
         ]
         
@@ -500,7 +475,7 @@ class FileIOController(QObject):
                     quoting=format_info['quoting'],
                     errors='replace', # エンコーディングエラー時の挙動
                     lineterminator=format_info['line_terminator'],
-                    escapechar=None if format_info.get('preserve_html', True) else '\\', 
+                    escapechar=None if format_info.get('preserve_html', True) else '\\',
                     doublequote=True # クォート内のクォートは二重にする (CSV標準)
                 )
             

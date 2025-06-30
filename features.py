@@ -2,14 +2,17 @@
 
 import csv
 import pandas as pd
-from PySide6.QtCore import QObject, Signal, QRunnable, Slot, QCoreApplication, QThread
+# 🔥 修正: os, traceback をファイル冒頭に移動
+import os
+import traceback
+from PySide6.QtCore import QObject, Signal, QRunnable, Slot, QCoreApplication, QThread, QTimer
 from PySide6.QtWidgets import QApplication
 from concurrent.futures import ThreadPoolExecutor
 import time
 import re
-import traceback
 import math
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
+
 
 #==============================================================================
 # 1. 非同期処理管理クラス
@@ -21,7 +24,8 @@ class Worker(QRunnable):
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
-        self.signals = kwargs.get('signals')
+        # self.signals = kwargs.get('signals') # signalsは使用されていないので削除可
+
 
     @Slot()
     def run(self):
@@ -30,23 +34,32 @@ class Worker(QRunnable):
         except Exception as e:
             error_info = traceback.format_exc()
             print(f"Worker thread error:\n{error_info}")
-            if self.signals and hasattr(self.signals, 'error_occurred'):
-                self.signals.error_occurred.emit(f"バックグラウンド処理でエラーが発生しました:\n{e}")
+            # Workerクラス自体からエラーシグナルを発行することも可能だが、
+            # AsyncDataManagerのエラーハンドリングに任せる
+            # if self.signals and hasattr(self.signals, 'error_occurred'):
+            #     self.signals.error_occurred.emit(f"バックグラウンド処理でエラーが発生しました:\n{e}")
 
 
 class AsyncDataManager(QObject):
     """データ処理をバックグラウンドで実行し、UIの応答性を維持する"""
     data_ready = Signal(pd.DataFrame)
-    task_progress = Signal(str, int, int)
+    task_progress = Signal(str, int, int) # main_qt._update_progress_dialogに接続
     search_results_ready = Signal(list)
     analysis_results_ready = Signal(str)
     replace_from_file_completed = Signal(list, str)
     product_discount_completed = Signal(list, str)
 
-    # 新しいシグナルを追加
+    # UIへの安全な通知シグナル
     close_progress_requested = Signal()
     status_message_requested = Signal(str, int, bool)
     show_welcome_requested = Signal()
+    cleanup_backend_requested = Signal() # 新規追加: バックエンドクリーンアップ要求シグナル
+
+    # ファイル読み込み用の新しいプログレスシグナル
+    # main_qtに直接接続する（AsyncDataManagerがemitし、main_qtがLoadingOverlayを制御）
+    file_loading_started = Signal()
+    file_loading_progress = Signal(str, int, int)
+    file_loading_finished = Signal()
     
     def __init__(self, app_instance):
         super().__init__()
@@ -57,11 +70,24 @@ class AsyncDataManager(QObject):
         self.is_cancelled = False
         self.current_task = None
 
-        # シグナルを接続
-        self.close_progress_requested.connect(app_instance._close_progress_dialog)
-        self.status_message_requested.connect(app_instance.show_operation_status)
-        self.show_welcome_requested.connect(app_instance.view_controller.show_welcome_screen)
+        # AsyncDataManager自身のUI通知シグナル
+        # これらのシグナルは、AsyncDataManagerが直接管理するプログレス表示（QProgressDialog）や
+        # ステータスバーメッセージ、ウェルカム画面表示に接続される
+        self.close_progress_requested.connect(self.app._close_progress_dialog)
+        self.status_message_requested.connect(self.app.show_operation_status)
+        self.show_welcome_requested.connect(self.app.view_controller.show_welcome_screen)
+        self.cleanup_backend_requested.connect(self.app._cleanup_backend) # 新規追加
 
+        # ファイル読み込み関連のシグナルはmain_qtに直接接続する（LoadingOverlayを制御するため）
+        self.file_loading_started.connect(self.app.file_loading_started)
+        self.file_loading_progress.connect(self.app.file_loading_progress)
+        self.file_loading_finished.connect(self.app.file_loading_finished)
+        
+        # タイムアウト保護
+        self.timeout_timer = QTimer()
+        self.timeout_timer.setSingleShot(True)
+        self.timeout_timer.timeout.connect(self._handle_timeout)
+        
     def cancel_current_task(self):
         """現在の非同期タスクにキャンセルを要求する"""
         self.is_cancelled = True
@@ -70,102 +96,199 @@ class AsyncDataManager(QObject):
         if self.current_task and isinstance(self.current_task, (QThread, ProductDiscountTask)):
             if hasattr(self.current_task, 'cancelled'):
                 self.current_task.cancelled = True
+        # タイムアウトタイマーがアクティブなら停止
+        if self.timeout_timer.isActive():
+            self.timeout_timer.stop()
 
     def load_full_dataframe_async(self, filepath, encoding, load_mode):
         self.is_cancelled = False
-        # プログレスダイアログを表示
-        self.app._show_progress_dialog(
-            f"「{os.path.basename(filepath)}」を読み込み中...",
-            self.cancel_current_task # キャンセルコールバックとして自身のメソッドを渡す
-        )
+        self.current_load_mode = load_mode # AsyncDataManagerが現在のロードモードを保持
+
+        # ローディングオーバーレイの開始シグナルをemit
+        self.file_loading_started.emit()
+
+        # タイムアウトタイマーを開始（30秒）
+        self.timeout_timer.start(30000)
+        
+        # filepathとencodingをインスタンス変数に保存 (エラーハンドリングで必要になる可能性があるため)
+        self.current_filepath = filepath
+        self.current_encoding = encoding
+
         worker = Worker(self._do_load_full_df, filepath, encoding, load_mode)
         self.executor.submit(worker.run)
+    
+    def _handle_timeout(self):
+        """読み込みタイムアウト時の処理"""
+        print("WARNING: ファイル読み込みがタイムアウトしました")
+        self.cancel_current_task() # タイムアウト発生時はタスクをキャンセル
+        self.file_loading_finished.emit() # ローディング画面を閉じる
+        self.status_message_requested.emit(
+            "ファイル読み込みがタイムアウトしました。より大きなファイルモードで再試行してください。",
+            5000, True
+        )
+        self.cleanup_backend_requested.emit() # バックエンドをクリーンアップ
+        self.show_welcome_requested.emit()
 
     def _do_load_full_df(self, filepath, encoding, load_mode, **kwargs):
         from db_backend import SQLiteBackend
         from lazy_loader import LazyCSVLoader
-        
+
         df = None
         try:
+            # タイムアウトタイマーを停止
+            if self.timeout_timer.isActive():
+                self.timeout_timer.stop()
+
+            # ファイルIOコントローラーから引き継がれたエンコーディング検出とファイルサイズ確認は
+            # ここでは行わないが、進捗通知はここから発行する
+            self.file_loading_progress.emit(
+                "ファイルを読み込み中...", 0, 100
+            )
+
             if load_mode == 'sqlite':
                 self.backend_instance = SQLiteBackend(self.app)
+                # 🔥 追加: main_windowにも設定
+                self.app.db_backend = self.backend_instance
                 self.backend_instance.cancelled = self.is_cancelled
 
                 def progress_callback(status, current, total):
                     if self.is_cancelled:
                         self.backend_instance.cancelled = True
                         return False # キャンセルを伝える
-                    self.task_progress.emit(status, current, total)
-                    # self.app._update_progress_dialog(status, current, total) # 🔥 main_windowのプログレスを更新
-                    # main_qt.pyの_update_progress_dialogはAsyncDataManager.task_progressに接続されているので、ここで直接呼ぶ必要はない。
-                    # ここでの直接呼び出しは、クロススレッドアクセスの問題は起こさないものの、冗長かつ誤解を招くため削除。
+                    # AsyncDataManagerの新しいファイル読み込み進捗シグナルに接続
+                    self.file_loading_progress.emit(status, current, total)
                     return True # 続行
 
-                columns, total_rows = self.backend_instance.import_csv_with_progress( # total_rowsも取得
-                    filepath, 
-                    encoding,
-                    progress_callback=progress_callback
+                columns, total_rows = self.backend_instance.import_csv_with_progress(
+                    filepath, encoding, progress_callback=progress_callback
                 )
-                
-                # self.app._close_progress_dialog() # 🔥 プログレスを閉じる
-                self.close_progress_requested.emit() # ← 安全
+
+                # プログレスダイアログを閉じるシグナルを確実にemit
+                self.file_loading_finished.emit()
 
                 if self.is_cancelled or columns is None:
                     self.backend_instance.close()
                     self.backend_instance = None
-                    # self.app.show_operation_status("読み込みをキャンセルしました。", 3000) # 🔥 状態通知
-                    self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False) # ← 安全
-                    # self.app.view_controller.show_welcome_screen() # 🔥 ウェルカム画面に戻す
-                    self.show_welcome_requested.emit() # ← 安全
+                    self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False)
+                    self.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
+                    self.show_welcome_requested.emit()
                     return # ここで終了
 
                 if columns is not None:
                     self.backend_instance.header = columns
-                    self.backend_instance.total_rows = total_rows # 総行数を設定
-                    # 🔥 SQLiteモードの場合は、AsyncDataManagerから直接FileIOControllerのシグナルをemit
-                    # main_qt.pyがこれを受けてbackendを設定する
-                    self.app.file_io_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
+                    self.backend_instance.total_rows = total_rows
+                    # 🔥 修正: file_io_controller → file_controller
+                    if hasattr(self.app, 'file_controller'): # 属性の存在チェックを追加
+                        self.app.file_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
+                    else:
+                        # フォールバック：file_controllerが見つからない場合は直接_on_file_loadedを呼ぶ
+                        # ただし、これは通常発生しないはず
+                        from PySide6.QtCore import QTimer
+                        QTimer.singleShot(0, lambda: self.app._on_file_loaded(self.backend_instance, filepath, encoding))
                     return # ここで終了
-            
+
             elif load_mode == 'lazy':
                 self.backend_instance = LazyCSVLoader(filepath, encoding)
-                # self.app._close_progress_dialog() # 🔥 プログレスを閉じる
-                self.close_progress_requested.emit() # ← 安全
-                # 🔥 Lazyモードも同様に、AsyncDataManagerから直接FileIOControllerのシグナルをemit
-                self.app.file_io_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
+                # プログレスダイアログを閉じるシグナルを確実にemit
+                self.file_loading_finished.emit()
+                
+                # 🔥 修正: file_io_controller → file_controller
+                if hasattr(self.app, 'file_controller'): # 属性の存在チェックを追加
+                    self.app.file_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
+                else:
+                    # フォールバック
+                    from PySide6.QtCore import QTimer
+                    QTimer.singleShot(0, lambda: self.app._on_file_loaded(self.backend_instance, filepath, encoding))
                 return # ここで終了
-            
-            else: # normal mode
-                self.task_progress.emit("ファイルをメモリに読み込み中...", 0, 0)
-                df = pd.read_csv(filepath, encoding=encoding, dtype=str).fillna('')
-                self.task_progress.emit("読み込み完了", 1, 1)
-                # self.app._close_progress_dialog() # 🔥 プログレスを閉じる
-                self.close_progress_requested.emit() # ← 安全
 
-            # normalモードの場合のみdata_readyシグナルを送信
-            if not self.is_cancelled and load_mode == 'normal':
-                self.data_ready.emit(df if df is not None else pd.DataFrame()) # data_readyはDataFrameを期待
-            elif self.is_cancelled: # normalモードでキャンセルされた場合
-                 # self.app.show_operation_status("読み込みをキャンセルしました。", 3000)
-                 self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False)
-                 # self.app.view_controller.show_welcome_screen()
-                 self.show_welcome_requested.emit()
+            else: # normal mode
+                # 通常モードの進捗表示を改善
+                self.file_loading_progress.emit("ファイルをメモリに読み込み中...", 0, 100)
+                
+                chunks = []
+                chunk_size = 10000 # 10,000行ずつ読み込み
+                
+                try:
+                    # 最初に行数を高速カウント
+                    # _fast_line_countのような外部コマンドはfeatures.pyの依存関係を増やさないため避ける
+                    # ここではPython標準のsum(1 for _ in f)を使用
+                    with open(filepath, 'r', encoding=encoding, errors='ignore') as f: # errors='ignore'を追加
+                        total_lines = sum(1 for _ in f) # ヘッダー行を含む
+                        if total_lines > 0: # ヘッダー行を除くデータ行数
+                            total_data_lines = total_lines - 1
+                        else:
+                            total_data_lines = 0
+
+                    # チャンク読み込み
+                    # config.py から CSV_READ_OPTIONS を参照する
+                    read_options = self.app.file_controller.config.CSV_READ_OPTIONS.copy() # 🔥 修正: file_io_controller → file_controller
+                    read_options['encoding'] = encoding
+
+                    # 楽天市場CSVの特殊な処理 (file_io_controllerからも移行)
+                    try:
+                        with open(filepath, 'r', encoding=encoding) as f_peek:
+                            first_line = f_peek.readline()
+                            if first_line.count(',') > 100:
+                                if read_options.get('engine') != 'python':
+                                    read_options['low_memory'] = False
+                    except Exception as e_peek:
+                        print(f"WARNING: ファイルの先頭行読み込み中にエラー (AsyncDataManager): {e_peek}")
+                        pass
+                        
+                    reader = pd.read_csv(filepath, encoding=encoding, dtype=str,
+                                        chunksize=chunk_size, on_bad_lines='skip', **read_options) # 🔥 修正: errors → on_bad_lines
+                    
+                    rows_read = 0
+                    for i, chunk in enumerate(reader):
+                        if self.is_cancelled:
+                            break
+                            
+                        chunks.append(chunk.fillna('')) # NaNを空文字列に変換
+                        rows_read += len(chunk)
+                        
+                        # 進捗を正確に計算
+                        if total_data_lines > 0:
+                            progress = min(int((rows_read / total_data_lines) * 100), 99) # 99%まで
+                        else:
+                            progress = 100 # データ行がない場合も100%に
+                        self.file_loading_progress.emit(
+                            f"データをメモリに読み込み中... ({rows_read:,}/{total_data_lines:,}行)", 
+                            progress, 100
+                        )
+                    
+                    if not self.is_cancelled:
+                        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=self.app.table_model._headers) # 空の場合のヘッダー考慮
+                        self.file_loading_progress.emit("読み込み完了", 100, 100)
+                    
+                except Exception as e_chunk:
+                    # チャンク読み込みが失敗した場合は通常の読み込みにフォールバック
+                    print(f"チャンク読み込みエラー、通常読み込みに切り替え (AsyncDataManager): {e_chunk}")
+                    df = pd.read_csv(filepath, encoding=encoding, dtype=str, on_bad_lines='skip').fillna('') # 🔥 修正: errors → on_bad_lines
+                    self.file_loading_progress.emit("読み込み完了", 100, 100)
+                
+                # プログレスダイアログを閉じるシグナルを確実にemit
+                self.file_loading_finished.emit()
+
+                if not self.is_cancelled:
+                    self.data_ready.emit(df if df is not None else pd.DataFrame())
+                else: # normalモードでキャンセルされた場合
+                    self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False)
+                    self.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
+                    self.show_welcome_requested.emit()
 
         except Exception as e:
             error_message = f"ファイル読み込みエラー: {e}"
-            print(error_message)
+            print(f"ERROR in _do_load_full_df: {error_message}")
             traceback.print_exc()
-            # self.app._close_progress_dialog() # 🔥 プログレスを閉じる
-            self.close_progress_requested.emit() # ← 安全
-            if QApplication.instance():
-                self.task_progress.emit(f"エラー: {e}", 1, 1)
-                # self.app.show_operation_status(f"ファイル読み込みエラー: {e}", 5000, True) # 🔥 エラー通知
-                self.status_message_requested.emit(f"ファイル読み込みエラー: {e}", 5000, True)
-                # self.app.view_controller.show_welcome_screen() # 🔥 ウェルカム画面に戻す
-                self.show_welcome_requested.emit()
-            # エラー時は空のDataFrameを送信 (normalモードの場合のみ考慮されるが、一応残す)
-            # ただし、error_occurredシグナルでUIに通知されるべき
-            self.data_ready.emit(pd.DataFrame())
+            
+            # エラー時も必ずプログレスダイアログを閉じる
+            self.file_loading_finished.emit()
+            
+            self.task_progress.emit(f"エラー: {e}", 1, 1) # task_progressは従来のQProgressDialog向けだが、念のため
+            self.status_message_requested.emit(error_message, 5000, True)
+            self.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+            self.show_welcome_requested.emit()
+            self.data_ready.emit(pd.DataFrame()) # エラー時は空のDataFrameを送信
 
     def search_data_async(self, settings: dict, current_load_mode: str, parent_child_data: dict, selected_rows: set):
         self.is_cancelled = False
@@ -180,22 +303,36 @@ class AsyncDataManager(QObject):
         is_regex = settings["is_regex"]
         in_selection_only = settings["in_selection_only"]
         
-        results = []
+        results = [] # このresultsに最終的な (row_idx, col_idx) を追加する
         
         try:
             self.task_progress.emit("検索中...", 0, 0)
 
             if current_load_mode == 'sqlite':
-                if self.backend_instance:
-                    # SQLiteBackend.search は rowid と col_name を返す想定
-                    # features.pyの_do_search_in_fileと同様の形式に変換
-                    # 修正: headersの取得方法を修正
-                    headers = self.app.table_model._headers # main_windowを通じてヘッダーを取得
-                    col_name_to_idx = {name: idx for idx, name in enumerate(headers)}
-                    raw_results = self.backend_instance.search(search_term, target_columns, is_case_sensitive, is_regex)
-                    for row_idx, col_name in raw_results:
-                        if col_name in col_name_to_idx:
-                            results.append((row_idx, col_name_to_idx[col_name]))
+                # 🔥 修正: main_windowのdb_backendを直接参照
+                db_backend = self.app.db_backend if hasattr(self.app, 'db_backend') and self.app.db_backend else self.backend_instance
+                
+                if db_backend and hasattr(db_backend, 'search'):
+                    print(f"DEBUG: SQLite検索開始 - backend: {db_backend}")
+                    
+                    # db_backend.search は既に (row_idx, col_idx) を返すように修正済みなので、
+                    # そのままresultsに代入またはextendする
+                    raw_results_from_db = db_backend.search( # 変数名を変更
+                        search_term, 
+                        target_columns, 
+                        is_case_sensitive, 
+                        is_regex
+                    )
+                    print(f"DEBUG: SQLite検索結果: {len(raw_results_from_db)}件")
+                    
+                    # db_backend.searchからの結果は既に(row_idx, col_idx)形式なので、そのまま使用
+                    results.extend(raw_results_from_db) # 直接resultsに追加
+                else:
+                    print("ERROR: SQLiteバックエンドが見つかりません")
+                    self.status_message_requested.emit("エラー: データベースが初期化されていません", 5000, True)
+                    self.search_results_ready.emit([])
+                    self.task_progress.emit("検索エラー", 1, 1)
+                    return # ここで終了
 
             elif current_load_mode == 'lazy':
                 if self.backend_instance:
@@ -205,10 +342,11 @@ class AsyncDataManager(QObject):
                             self.backend_instance.cancelled = True
                         self.task_progress.emit("ファイル内を検索中...", current, total_rows)
                     
-                    results = self.backend_instance.search_in_file(
+                    lazy_results = self.backend_instance.search_in_file( # 変数名を変更
                         search_term, target_columns, is_case_sensitive, is_regex,
                         progress_callback=progress_callback
                     )
+                    results.extend(lazy_results) # 結果をresultsに追加
             
             else: # normal mode (DataFrame in memory)
                 df = self.app.table_model._dataframe
@@ -217,51 +355,58 @@ class AsyncDataManager(QObject):
                     self.task_progress.emit("検索完了", 1, 1)
                     return
 
-                pattern = re.compile(search_term if is_regex else re.escape(search_term),
-                                     0 if is_case_sensitive else re.IGNORECASE)
-
+                pattern = re.compile(
+                    search_term if is_regex else re.escape(search_term),
+                    0 if is_case_sensitive else re.IGNORECASE
+                )
+                
                 target_rows = list(range(df.shape[0]))
+                
                 if in_selection_only:
-                    target_rows = sorted(list(selected_rows.intersection(target_rows)))
-
+                    selected_row_indices = {idx.row() for idx in self.app.table_view.selectionModel().selectedIndexes()}
+                    target_rows = sorted(list(selected_row_indices.intersection(target_rows)))
+                
                 headers = self.app.table_model._headers
                 target_col_indices = {headers.index(name) for name in target_columns if name in headers}
                 
                 total_search_cells = len(target_rows) * len(target_col_indices)
                 processed_cells = 0
-
+                
                 for row_idx in target_rows:
                     if self.is_cancelled:
                         self.task_progress.emit("検索がキャンセルされました", 1, 1)
                         self.search_results_ready.emit([])
                         return
-
+                    
                     for col_idx in target_col_indices:
                         if col_idx < len(df.columns):
                             cell_value = df.iat[row_idx, col_idx]
                             if cell_value is not None and pattern.search(str(cell_value)):
-                                results.append((row_idx, col_idx))
+                                results.append((row_idx, col_idx)) # normal modeの結果もresultsに追加
                         
                         processed_cells += 1
                         if processed_cells % 1000 == 0:
-                            self.task_progress.emit("データ内を検索中...", processed_cells, total_search_cells)
-
+                            self.task_progress.emit(
+                                "データ内を検索中...", 
+                                processed_cells, 
+                                total_search_cells
+                            )
+            
             self.task_progress.emit("検索完了", 1, 1)
+            
         except re.error as e:
             if QApplication.instance():
-                # QCoreApplication.instance().callLater(self.app.show_operation_status, f"正規表現エラー: {e}", 5000, True)
                 self.status_message_requested.emit(f"正規表現エラー: {e}", 5000, True)
             self.search_results_ready.emit([])
             return
         except Exception as e:
             print(f"Error during search: {traceback.format_exc()}")
             if QApplication.instance():
-                # QCoreApplication.instance().callLater(self.app.show_operation_status, f"検索中にエラーが発生しました: {e}", 5000, True)
                 self.status_message_requested.emit(f"検索中にエラーが発生しました: {e}", 5000, True)
             self.search_results_ready.emit([])
             return
-
-        self.search_results_ready.emit(results)
+        
+        self.search_results_ready.emit(results) # 最終的なresultsをemit
 
     def analyze_parent_child_async(self, db_backend_instance, column_name, mode):
         self.is_cancelled = False
@@ -531,9 +676,10 @@ class ProductDiscountTask(QThread):
                         continue
                         
                     discount_rate = Decimal(str(discount_lookup[product_id]))
-                    discounted_price_decimal = Decimal(str(current_price)) * (Decimal('1.0') - discount_rate)
+                    discounted_price_decimal = Decimal('1.0') - discount_rate # 割引率を乗数に変換
+                    final_price_decimal = Decimal(str(current_price)) * discounted_price_decimal
                     
-                    final_price = self._apply_rounding(float(discounted_price_decimal), self.params['round_mode'])
+                    final_price = self._apply_rounding(float(final_price_decimal), self.params['round_mode'])
                     final_price_str = str(int(final_price))
                     
                     if current_price_str != final_price_str:
@@ -585,16 +731,18 @@ class ProductDiscountTask(QThread):
                             continue
                             
                         discount_rate = Decimal(str(discount_lookup[product_id]))
-                        discounted_price_decimal = Decimal(str(current_price)) * (Decimal('1.0') - discount_rate)
+                        discounted_price_decimal = Decimal('1.0') - discount_rate # 割引率を乗数に変換
+                        final_price_decimal = Decimal(str(current_price)) * discounted_price_decimal
                         
-                        final_price = self._apply_rounding(float(discounted_price_decimal), self.params['round_mode'])
+                        final_price = self._apply_rounding(float(final_price_decimal), self.params['round_mode'])
                         final_price_str = str(int(final_price))
                         
                         if current_price_str != final_price_str:
                             changes.append({
                                 'row_idx': idx,
                                 'col_name': price_col,
-                                'new_value': final_price_str
+                                'new_value': final_price_str,
+                                'old_value': current_price_str # Undoのために旧値も保存
                             })
                             
                     except Exception as e:
@@ -605,7 +753,7 @@ class ProductDiscountTask(QThread):
                     self.task_progress.emit(f"DBデータを処理中... ({idx}/{total_rows})", 50 + int(idx/total_rows * 40), 100)
 
             if changes:
-                # この changes は {row_idx, col_name, new_value} 形式。
+                # この changes は {row_idx, col_name, new_value, old_value} 形式。
                 # Undo履歴に追加するために {item, column, old, new} 形式に変換する必要がある。
                 # しかし、ここではDBの更新のみを行い、Undo履歴への追加は main_qt.py で行うのが適切。
                 # main_qt.py (_on_product_discount_completed) で changes を受け取り、Undo Manager に追加するようにする。
