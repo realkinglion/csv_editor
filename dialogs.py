@@ -212,14 +212,16 @@ class MergeSeparatorDialog(QDialog):
 
 class PriceCalculatorDialog(QDialog):
     """金額計算ツールダイアログ"""
-    def __init__(self, parent=None, headers=None):
+    def __init__(self, parent=None, headers=None, initial_column_name=None):
         super().__init__(parent)
         self.headers = headers if headers is not None else []
+        self.initial_column_name = initial_column_name
         self.setWindowTitle("金額計算ツール")
         self.setMinimumSize(300, 200)
         self.result = {}
         self.setupUi()
         self.connectSignals()
+        self._apply_initial_selection() # ⭐ 追加
 
     def setupUi(self):
         layout = QVBoxLayout(self)
@@ -279,6 +281,13 @@ class PriceCalculatorDialog(QDialog):
                            'round' if self.round_round_radio.isChecked() else 'ceil')
         }
         self.accept()
+
+    def _apply_initial_selection(self):
+        """初期選択列の自動セット"""
+        if self.initial_column_name and self.initial_column_name in self.headers:
+            idx = self.headers.index(self.initial_column_name)
+            self.column_combo.setCurrentIndex(idx)
+        # else: 何もしなくてもデフォルトで先頭が選ばれる
 
 class PasteOptionDialog(QDialog):
     """貼り付けオプションを選択するダイアログ"""
@@ -763,4 +772,132 @@ class NewFileDialog(QDialog):
         return {
             'columns': columns,
             'initial_rows': initial_rows
+        }
+
+# dialogs.py の最後に追加
+class RemoveDuplicatesDialog(QDialog):
+    """重複行削除の設定ダイアログ"""
+    
+    def __init__(self, parent=None, headers=None):
+        super().__init__(parent)
+        self.headers = headers or []
+        self.setWindowTitle("重複行の削除")
+        self.setMinimumSize(400, 300)
+        self.result = {}
+        self.setupUi()
+    
+    def setupUi(self):
+        layout = QVBoxLayout(self)
+        
+        # 説明ラベル
+        info_label = QLabel("重複を判定する基準を選択してください。")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # 重複判定基準
+        criteria_group = QGroupBox("重複判定基準")
+        criteria_layout = QVBoxLayout(criteria_group)
+        
+        self.all_columns_radio = QRadioButton("すべての列が一致する行を重複とみなす")
+        self.all_columns_radio.setChecked(True)
+        criteria_layout.addWidget(self.all_columns_radio)
+        
+        self.selected_columns_radio = QRadioButton("選択した列が一致する行を重複とみなす")
+        criteria_layout.addWidget(self.selected_columns_radio)
+        
+        # 列選択リスト
+        self.column_list = QListWidget()
+        self.column_list.setSelectionMode(QListWidget.MultiSelection)
+        self.column_list.setEnabled(False)
+        for header in self.headers:
+            self.column_list.addItem(header)
+        criteria_layout.addWidget(self.column_list)
+        
+        layout.addWidget(criteria_group)
+        
+        # 保持する行の選択
+        keep_group = QGroupBox("保持する行")
+        keep_layout = QVBoxLayout(keep_group)
+        
+        self.keep_first_radio = QRadioButton("最初の行を保持（デフォルト）")
+        self.keep_first_radio.setChecked(True)
+        self.keep_last_radio = QRadioButton("最後の行を保持")
+        
+        keep_layout.addWidget(self.keep_first_radio)
+        keep_layout.addWidget(self.keep_last_radio)
+        
+        layout.addWidget(keep_group)
+        
+        # プレビュー情報
+        self.preview_label = QLabel("重複行数: 計算中...")
+        layout.addWidget(self.preview_label)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+        
+        # シグナル接続
+        self.selected_columns_radio.toggled.connect(self.column_list.setEnabled)
+        
+        # プレビュー更新のトリガー
+        self.all_columns_radio.toggled.connect(self._update_preview)
+        self.selected_columns_radio.toggled.connect(self._update_preview)
+        self.column_list.itemSelectionChanged.connect(self._update_preview)
+        self.keep_first_radio.toggled.connect(self._update_preview)
+        self.keep_last_radio.toggled.connect(self._update_preview)
+        
+        # 初期プレビュー更新
+        QTimer.singleShot(100, self._update_preview)
+
+    def _update_preview(self):
+        """重複行数を計算し、プレビューラベルを更新する"""
+        try:
+            parent_window = self.parent()
+            if not hasattr(parent_window, 'table_model'):
+                self.preview_label.setText("重複行数: データモデルが見つかりません。")
+                return
+            
+            current_df = parent_window.table_model.get_dataframe()
+            if current_df is None or current_df.empty:
+                self.preview_label.setText("重複行数: 0 (データがありません)")
+                return
+            
+            total_rows = len(current_df)
+            
+            temp_settings = self.get_result() # 現在のダイアログ設定を取得
+            
+            if temp_settings['use_all_columns']:
+                df_unique = current_df.drop_duplicates(keep=temp_settings['keep'])
+            else:
+                if not temp_settings['selected_columns']:
+                    self.preview_label.setText("重複行数: 列を選択してください")
+                    return
+                # 選択された列がDataFrameに存在するかチェック
+                valid_columns = [col for col in temp_settings['selected_columns'] if col in current_df.columns]
+                if not valid_columns:
+                    self.preview_label.setText("重複行数: 選択された列がデータに見つかりません")
+                    return
+                df_unique = current_df.drop_duplicates(subset=valid_columns, keep=temp_settings['keep'])
+            
+            removed_count = total_rows - len(df_unique)
+            self.preview_label.setText(f"重複行数: {removed_count}行 (総行数: {total_rows}行)")
+            
+        except Exception as e:
+            self.preview_label.setText(f"重複行数: 計算エラー ({e})")
+            print(f"Error updating duplicate preview: {e}")
+            
+    def get_result(self):
+        selected_columns = []
+        if self.selected_columns_radio.isChecked():
+            for i in range(self.column_list.count()):
+                item = self.column_list.item(i)
+                if item.isSelected():
+                    selected_columns.append(item.text())
+        
+        return {
+            'use_all_columns': self.all_columns_radio.isChecked(),
+            'selected_columns': selected_columns,
+            'keep': 'first' if self.keep_first_radio.isChecked() else 'last'
         }

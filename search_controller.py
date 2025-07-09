@@ -34,8 +34,14 @@ class SearchController(QObject):
             self.main_window.show_operation_status("検索条件を入力してください。", is_error=True)
             return
         
+        # ⭐ target_columnsが空の場合に警告
+        if not settings["target_columns"]:
+            self.main_window.show_operation_status("検索対象列が選択されていません。", is_error=True)
+            return
+
         settings_changed = self._last_search_settings != settings
         if not self.search_results or settings_changed:
+            self.clear_search_highlight() # 新しい検索前にハイライトをクリア
             self._last_search_settings = settings.copy()
             self.main_window.show_operation_status("検索中です...", duration=0)
             self._call_async_search(settings)
@@ -55,9 +61,15 @@ class SearchController(QObject):
         if not settings["search_term"]:
             self.main_window.show_operation_status("検索条件を入力してください。", is_error=True)
             return
+
+        # ⭐ target_columnsが空の場合に警告
+        if not settings["target_columns"]:
+            self.main_window.show_operation_status("検索対象列が選択されていません。", is_error=True)
+            return
         
         settings_changed = self._last_search_settings != settings
         if not self.search_results or settings_changed:
+            self.clear_search_highlight() # 新しい検索前にハイライトをクリア
             self._last_search_settings = settings.copy()
             self.main_window.show_operation_status("検索中です...", duration=0)
             self._call_async_search(settings)
@@ -75,11 +87,18 @@ class SearchController(QObject):
     def replace_current(self, settings):
         """現在の検索結果を置換"""
         if self.main_window.is_readonly_mode(for_edit=True):
-            self.main_window.show_operation_status("このモードでは置換できません。", 3000, is_error=True)
+            self.main_window.show_operation_status(
+                "このモードでは置換できません。", 3000, is_error=True
+            )
             return
         
         if not settings["search_term"]:
             self.main_window.show_operation_status("検索条件を入力してください。", is_error=True)
+            return
+
+        # ⭐ target_columnsが空の場合に警告
+        if not settings["target_columns"]:
+            self.main_window.show_operation_status("検索対象列が選択されていません。", is_error=True)
             return
         
         settings_changed = self._last_search_settings != settings
@@ -87,6 +106,7 @@ class SearchController(QObject):
             self.main_window.show_operation_status("置換対象を検索中です...", duration=0)
             self._pending_operations['replace_current'] = True
             self._pending_replace_current_settings = settings.copy()
+            self.clear_search_highlight() # 新しい検索前にハイライトをクリア
             self._last_search_settings = settings.copy()
             self._call_async_search(settings)
             return
@@ -99,6 +119,16 @@ class SearchController(QObject):
             self.main_window.show_operation_status("このモードではすべて置換できません。", 3000, is_error=True)
             return
         
+        if not settings["search_term"]:
+            self.main_window.show_operation_status("検索条件を入力してください。", is_error=True)
+            return
+
+        # ⭐ target_columnsが空の場合に警告
+        if not settings["target_columns"]:
+            self.main_window.show_operation_status("検索対象列が選択されていません。", is_error=True)
+            return
+
+        self.clear_search_highlight() # 新しい検索前にハイライトをクリア
         self._last_search_settings = settings.copy()
         self._pending_operations['replace_all'] = True
         self._pending_replace_settings = settings.copy()
@@ -113,9 +143,15 @@ class SearchController(QObject):
             self.main_window.show_operation_status("検索条件を入力してください。", is_error=True)
             return
 
+        # ⭐ target_columnsが空の場合に警告
+        if not settings["target_columns"]:
+            self.main_window.show_operation_status("検索対象列が選択されていません。", is_error=True)
+            return
+
         settings_changed = self._last_search_settings != settings
         if not self.search_results or settings_changed:
             print("DEBUG: 新しい検索が必要 - 検索を実行中") # デバッグログ追加
+            self.clear_search_highlight() # 新しい検索前にハイライトをクリア
             self._last_search_settings = settings.copy()
             self._pending_operations['extract'] = True
             self._pending_extract_settings = settings.copy()

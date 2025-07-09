@@ -3,7 +3,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QMenu, QToolBar, QStatusBar, QLabel, QPushButton, QProgressBar,
     QTableView, QHeaderView, QAbstractItemView, QStyle, QDockWidget,
-    QFormLayout, QTextEdit, QHBoxLayout, QScrollArea
+    QFormLayout, QTextEdit, QHBoxLayout, QScrollArea, QApplication # QApplication をインポート
 )
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtCore import Qt, QSize
@@ -191,13 +191,23 @@ class Ui_MainWindow(object):
         MainWindow.paste_column_action = QAction("列に貼り付け", MainWindow)
         MainWindow.paste_column_action.setShortcut(QKeySequence("Ctrl+Shift+V"))
         MainWindow.add_row_action = QAction("行を追加", MainWindow)
+        # 修正2: 行・列操作のショートカットを追加
+        MainWindow.add_row_action.setShortcut(QKeySequence("Ctrl++"))
         MainWindow.add_column_action = QAction("右に列を挿入", MainWindow)
+        MainWindow.add_column_action.setShortcut(QKeySequence("Ctrl+Shift++"))
         MainWindow.delete_selected_rows_action = QAction("選択行を削除", MainWindow)
+        MainWindow.delete_selected_rows_action.setShortcut(QKeySequence("Ctrl+-"))
         MainWindow.delete_selected_column_action = QAction("選択列を削除", MainWindow)
+        MainWindow.delete_selected_column_action.setShortcut(QKeySequence("Ctrl+Shift+-"))
+
         sort_menu = QMenu("ソート", MainWindow)
         MainWindow.sort_asc_action = QAction("現在の列を昇順でソート", MainWindow)
+        # 修正2: ソートアクションにショートカット追加
+        MainWindow.sort_asc_action.setShortcut(QKeySequence("Ctrl+Up"))
         MainWindow.sort_desc_action = QAction("現在の列を降順でソート", MainWindow)
+        MainWindow.sort_desc_action.setShortcut(QKeySequence("Ctrl+Down"))
         MainWindow.clear_sort_action = QAction("ソートをクリア", MainWindow)
+        MainWindow.clear_sort_action.setShortcut(QKeySequence("Ctrl+Backspace"))
         sort_menu.addAction(MainWindow.sort_asc_action)
         sort_menu.addAction(MainWindow.sort_desc_action)
         sort_menu.addSeparator()
@@ -206,6 +216,16 @@ class Ui_MainWindow(object):
         MainWindow.select_all_action.setShortcut(QKeySequence.SelectAll)
         MainWindow.search_action = QAction("検索パネル", MainWindow)
         MainWindow.search_action.setShortcut(QKeySequence.Find)
+        
+        # 重複行削除アクションの追加
+        MainWindow.remove_duplicates_action = QAction("重複行を削除...", MainWindow)
+        MainWindow.remove_duplicates_action.setShortcut(QKeySequence("Ctrl+Shift+D"))
+
+        # 修正2: ビュー切り替えにショートカット追加
+        MainWindow.view_toggle_action = QAction(MainWindow.style().standardIcon(QStyle.SP_FileDialogDetailedView), "カードビュー", MainWindow)
+        MainWindow.view_toggle_action.setShortcut(QKeySequence("Ctrl+Tab"))
+
+
         MainWindow.edit_menu.addAction(MainWindow.undo_action)
         MainWindow.edit_menu.addAction(MainWindow.redo_action)
         MainWindow.edit_menu.addSeparator()
@@ -229,6 +249,8 @@ class Ui_MainWindow(object):
         MainWindow.edit_menu.addAction(MainWindow.select_all_action)
         MainWindow.edit_menu.addSeparator()
         MainWindow.edit_menu.addAction(MainWindow.search_action)
+        MainWindow.edit_menu.addSeparator() #
+        MainWindow.edit_menu.addAction(MainWindow.remove_duplicates_action) #
 
         MainWindow.tools_menu = menuBar.addMenu("ツール(&T)")
         MainWindow.price_calculator_action = QAction("金額計算ツール...", MainWindow)
@@ -245,23 +267,63 @@ class Ui_MainWindow(object):
         MainWindow.shortcuts_action = QAction("ショートカットキー一覧", MainWindow)
         help_menu.addAction(MainWindow.shortcuts_action)
         
-        MainWindow.diagnose_action = QAction("表示診断（デバッグ）", MainWindow)
-        help_menu.addAction(MainWindow.diagnose_action)
+        # 🔧 開発者向け機能を分離
+        help_menu.addSeparator()
+        dev_menu = help_menu.addMenu("開発者機能")
         
-        MainWindow.force_show_action = QAction("強制表示（デバッグ）", MainWindow)
-        help_menu.addAction(MainWindow.force_show_action)
+        # テスト・デバッグ機能をここに集約
+        MainWindow.test_action = QAction("サンプルデータ読み込み", MainWindow)
+        MainWindow.diagnose_action = QAction("表示診断", MainWindow)
+        MainWindow.force_show_action = QAction("強制表示", MainWindow)
+        
+        dev_menu.addAction(MainWindow.test_action)
+        dev_menu.addAction(MainWindow.diagnose_action)
+        dev_menu.addAction(MainWindow.force_show_action)
+        
+        # 🔧 本番環境では非表示
+        import os
+        if os.environ.get('CSV_EDITOR_DEBUG', '0') != '1':
+            dev_menu.menuAction().setVisible(False)
 
+        # 🚨 安全対策と緊急復旧
+        help_menu.addSeparator()
+        emergency_action = QAction("ツールバー緊急復旧", MainWindow)
+        emergency_action.triggered.connect(MainWindow.emergency_reset_toolbar) # main_qt.py で定義されるメソッドを接続
+        help_menu.addAction(emergency_action)
 
     def _create_tool_bar(self, MainWindow):
         toolbar = MainWindow.addToolBar("Main Toolbar")
-        toolbar.setIconSize(QSize(24, 24))
-        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toolbar.setObjectName("MainToolbar") # 🔧 状態保存用の識別名
         
+        # 🔧 画面サイズに応じた初期設定
+        screen = QApplication.primaryScreen().geometry()
+        if screen.width() < 1400:
+            toolbar.setIconSize(QSize(18, 18))
+            toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        elif screen.width() < 1800:
+            toolbar.setIconSize(QSize(20, 20))
+            toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        else:
+            toolbar.setIconSize(QSize(22, 22))
+            toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        
+        # 🔧 最適化されたスタイルシート
         toolbar.setStyleSheet("""
             QToolButton {
-                padding: 4px 8px;
-                margin: 2px;
-                min-width: 60px;
+                padding: 2px 3px;
+                margin: 1px;
+                min-width: 30px;
+                max-width: 100px;
+                font-size: 8px;
+                font-weight: normal;
+            }
+            QToolButton:hover {
+                background-color: #E3F2FD;
+                border: 1px solid #2196F3;
+                border-radius: 2px;
+            }
+            QToolButton:pressed {
+                background-color: #BBDEFB;
             }
         """)
         
@@ -270,15 +332,19 @@ class Ui_MainWindow(object):
             action.setText(action.text().replace("✂️ ", "").replace("📋 ", "").replace("📎 ", "").replace("🗑️ ", "").replace("📊 ", "").replace("💰 ", ""))
             widget = toolbar.widgetForAction(action)
             if widget:
+                # TooltipEventFilter をインストールし、text_callback を渡す
                 tooltip_filter = TooltipEventFilter(widget, text_callback)
                 widget.installEventFilter(tooltip_filter)
+                # MainWindow に tooltip_filters リストを追加して、参照を保持する
+                # これにより、フィルタがガベージコレクションされないようにする
                 if not hasattr(MainWindow, 'tooltip_filters'):
                     MainWindow.tooltip_filters = []
                 MainWindow.tooltip_filters.append(tooltip_filter)
-
+                
         # グループ1: ファイル操作
-        add_action_with_tooltip(MainWindow.new_action, lambda: "新しいCSVファイルを作成します (Ctrl+N)")
-        add_action_with_tooltip(MainWindow.open_action, lambda: "新しいCSVファイルを開きます (Ctrl+O)")
+        # 🔥 修正のポイント：ツールチップのテキストを動的にする
+        add_action_with_tooltip(MainWindow.new_action, lambda: MainWindow.new_action.toolTip() or "新規作成")
+        add_action_with_tooltip(MainWindow.open_action, lambda: MainWindow.open_action.toolTip() or "開く")
         add_action_with_tooltip(MainWindow.save_action, lambda: f"現在の変更をファイルに上書き保存します (Ctrl+S)\nパス: {MainWindow.filepath or '未保存'}")
         toolbar.addSeparator()
         # グループ2: 編集操作
@@ -293,9 +359,9 @@ class Ui_MainWindow(object):
         MainWindow.add_column_action.setIcon(MainWindow.style().standardIcon(QStyle.SP_ArrowRight))
         MainWindow.delete_selected_rows_action.setIcon(MainWindow.style().standardIcon(QStyle.SP_TrashIcon))
         
-        add_action_with_tooltip(MainWindow.add_row_action, lambda: "カーソル位置の下に新しい行を追加します")
-        add_action_with_tooltip(MainWindow.add_column_action, lambda: "カーソル位置の右に新しい列を挿入します")
-        add_action_with_tooltip(MainWindow.delete_selected_rows_action, lambda: "選択されている行を削除します")
+        add_action_with_tooltip(MainWindow.add_row_action, lambda: "カーソル位置の下に新しい行を追加します (Ctrl++)")
+        add_action_with_tooltip(MainWindow.add_column_action, lambda: "カーソル位置の右に新しい列を挿入します (Ctrl+Shift++)")
+        add_action_with_tooltip(MainWindow.delete_selected_rows_action, lambda: "選択されている行を削除します (Ctrl+-)")
         toolbar.addSeparator()
         
         # グループ4: 検索と表示
@@ -303,14 +369,21 @@ class Ui_MainWindow(object):
         MainWindow.search_action.setText("検索パネル")
         add_action_with_tooltip(MainWindow.search_action, lambda: "検索・置換・抽出パネルの表示/非表示 (Ctrl+F)")
         
-        MainWindow.view_toggle_action = QAction(MainWindow.style().standardIcon(QStyle.SP_FileDialogDetailedView), "カードビュー", MainWindow)
-        add_action_with_tooltip(MainWindow.view_toggle_action, lambda: "テーブル表示とカード表示を切り替えます")
+        add_action_with_tooltip(MainWindow.view_toggle_action, lambda: "テーブル表示とカード表示を切り替えます (Ctrl+Tab)")
         toolbar.addSeparator()
         
         # グループ5: 高度な機能
         MainWindow.price_calculator_action.setIcon(MainWindow.style().standardIcon(QStyle.SP_DialogApplyButton))
-        MainWindow.price_calculator_action.setText("金額計算")
+        MainWindow.price_calculator_action.setText("金額計算") # 🔧 テキスト短縮
         add_action_with_tooltip(MainWindow.price_calculator_action, lambda: "選択列の金額を一括計算します")
+        toolbar.addSeparator()
+        
+        MainWindow.text_processing_action.setIcon(MainWindow.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        MainWindow.text_processing_action.setText("テキスト処理") # 🔧 テキスト短縮
+        add_action_with_tooltip(
+            MainWindow.text_processing_action,
+            lambda: "テキストに接頭辞追加・バイト数制限・単語境界調整を行います"
+        )
         toolbar.addSeparator()
         
         MainWindow.cell_concatenate_action.setText("セル連結")
@@ -319,17 +392,11 @@ class Ui_MainWindow(object):
         add_action_with_tooltip(MainWindow.column_concatenate_action, lambda: "選択列を隣の列と連結します")
         toolbar.addSeparator()
         
-        MainWindow.test_action = QAction(MainWindow.style().standardIcon(QStyle.SP_DialogHelpButton), "テストデータ", MainWindow)
-        add_action_with_tooltip(MainWindow.test_action, lambda: "動作確認用のサンプルデータを読み込みます")
+        # 🔧 以下をコメントアウト（メニューに移動済み）
+        # MainWindow.test_action = QAction(MainWindow.style().standardIcon(QStyle.SP_DialogHelpButton), "テストデータ", MainWindow)
+        # add_action_with_tooltip(MainWindow.test_action, lambda: "動作確認用のサンプルデータを読み込みます")
 
-        MainWindow.text_processing_action.setIcon(MainWindow.style().standardIcon(QStyle.SP_FileDialogContentsView))
-        add_action_with_tooltip(
-            MainWindow.text_processing_action,
-            lambda: "テキストに接頭辞追加・バイト数制限・単語境界調整を行います"
-        )
-        toolbar.addSeparator()
-        
-        add_action_with_tooltip(MainWindow.force_show_action, lambda: "表示がおかしい場合にテーブルを強制表示します（デバッグ用）")
+        # add_action_with_tooltip(MainWindow.force_show_action, lambda: "表示がおかしい場合にテーブルを強制表示します（デバッグ用）")
         
     def _create_card_view_container(self, MainWindow):
         layout = QFormLayout(MainWindow.card_view_container)

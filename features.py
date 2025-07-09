@@ -2,7 +2,6 @@
 
 import csv
 import pandas as pd
-# 🔥 修正: os, traceback をファイル冒頭に移動
 import os
 import traceback
 from PySide6.QtCore import QObject, Signal, QRunnable, Slot, QCoreApplication, QThread, QTimer
@@ -48,12 +47,13 @@ class AsyncDataManager(QObject):
     analysis_results_ready = Signal(str)
     replace_from_file_completed = Signal(list, str)
     product_discount_completed = Signal(list, str)
+    bulk_extract_completed = Signal(object, str) 
 
     # UIへの安全な通知シグナル
     close_progress_requested = Signal()
     status_message_requested = Signal(str, int, bool)
     show_welcome_requested = Signal()
-    cleanup_backend_requested = Signal() # 新規追加: バックエンドクリーンアップ要求シグナル
+    cleanup_backend_requested = Signal() 
 
     # ファイル読み込み用の新しいプログレスシグナル
     # main_qtに直接接続する（AsyncDataManagerがemitし、main_qtがLoadingOverlayを制御）
@@ -70,15 +70,11 @@ class AsyncDataManager(QObject):
         self.is_cancelled = False
         self.current_task = None
 
-        # AsyncDataManager自身のUI通知シグナル
-        # これらのシグナルは、AsyncDataManagerが直接管理するプログレス表示（QProgressDialog）や
-        # ステータスバーメッセージ、ウェルカム画面表示に接続される
         self.close_progress_requested.connect(self.app._close_progress_dialog)
         self.status_message_requested.connect(self.app.show_operation_status)
         self.show_welcome_requested.connect(self.app.view_controller.show_welcome_screen)
-        self.cleanup_backend_requested.connect(self.app._cleanup_backend) # 新規追加
+        self.cleanup_backend_requested.connect(self.app._cleanup_backend) 
 
-        # ファイル読み込み関連のシグナルはmain_qtに直接接続する（LoadingOverlayを制御するため）
         self.file_loading_started.connect(self.app.file_loading_started)
         self.file_loading_progress.connect(self.app.file_loading_progress)
         self.file_loading_finished.connect(self.app.file_loading_finished)
@@ -89,28 +85,27 @@ class AsyncDataManager(QObject):
         self.timeout_timer.timeout.connect(self._handle_timeout)
         
     def cancel_current_task(self):
-        """現在の非同期タスクにキャンセルを要求する"""
+        """現在の非同期タスクにキャンセルを要求する（スレッドセーフ版）"""
         self.is_cancelled = True
         if self.backend_instance:
             self.backend_instance.cancelled = True
         if self.current_task and isinstance(self.current_task, (QThread, ProductDiscountTask)):
             if hasattr(self.current_task, 'cancelled'):
                 self.current_task.cancelled = True
-        # タイムアウトタイマーがアクティブなら停止
+        
         if self.timeout_timer.isActive():
-            self.timeout_timer.stop()
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, self.timeout_timer.stop)
 
     def load_full_dataframe_async(self, filepath, encoding, load_mode):
         self.is_cancelled = False
-        self.current_load_mode = load_mode # AsyncDataManagerが現在のロードモードを保持
+        self.current_load_mode = load_mode 
 
-        # ローディングオーバーレイの開始シグナルをemit
         self.file_loading_started.emit()
 
         # タイムアウトタイマーを開始（30秒）
         self.timeout_timer.start(30000)
         
-        # filepathとencodingをインスタンス変数に保存 (エラーハンドリングで必要になる可能性があるため)
         self.current_filepath = filepath
         self.current_encoding = encoding
 
@@ -120,18 +115,19 @@ class AsyncDataManager(QObject):
     def _handle_timeout(self):
         """読み込みタイムアウト時の処理"""
         print("WARNING: ファイル読み込みがタイムアウトしました")
-        self.cancel_current_task() # タイムアウト発生時はタスクをキャンセル
-        self.file_loading_finished.emit() # ローディング画面を閉じる
+        self.cancel_current_task() 
+        self.file_loading_finished.emit() 
         self.status_message_requested.emit(
             "ファイル読み込みがタイムアウトしました。より大きなファイルモードで再試行してください。",
             5000, True
         )
-        self.cleanup_backend_requested.emit() # バックエンドをクリーンアップ
+        self.cleanup_backend_requested.emit() 
         self.show_welcome_requested.emit()
 
     def _do_load_full_df(self, filepath, encoding, load_mode, **kwargs):
         from db_backend import SQLiteBackend
         from lazy_loader import LazyCSVLoader
+        import config 
 
         df = None
         try:
@@ -139,92 +135,78 @@ class AsyncDataManager(QObject):
             if self.timeout_timer.isActive():
                 self.timeout_timer.stop()
 
-            # ファイルIOコントローラーから引き継がれたエンコーディング検出とファイルサイズ確認は
-            # ここでは行わないが、進捗通知はここから発行する
             self.file_loading_progress.emit(
                 "ファイルを読み込み中...", 0, 100
             )
 
             if load_mode == 'sqlite':
                 self.backend_instance = SQLiteBackend(self.app)
-                # 🔥 追加: main_windowにも設定
                 self.app.db_backend = self.backend_instance
                 self.backend_instance.cancelled = self.is_cancelled
 
                 def progress_callback(status, current, total):
                     if self.is_cancelled:
                         self.backend_instance.cancelled = True
-                        return False # キャンセルを伝える
-                    # AsyncDataManagerの新しいファイル読み込み進捗シグナルに接続
+                        return False 
                     self.file_loading_progress.emit(status, current, total)
-                    return True # 続行
+                    return True 
 
                 columns, total_rows = self.backend_instance.import_csv_with_progress(
                     filepath, encoding, progress_callback=progress_callback
                 )
 
-                # プログレスダイアログを閉じるシグナルを確実にemit
                 self.file_loading_finished.emit()
 
                 if self.is_cancelled or columns is None:
                     self.backend_instance.close()
                     self.backend_instance = None
                     self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False)
-                    self.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
+                    self.cleanup_backend_requested.emit() 
                     self.show_welcome_requested.emit()
-                    return # ここで終了
+                    return 
 
                 if columns is not None:
                     self.backend_instance.header = columns
                     self.backend_instance.total_rows = total_rows
-                    # 🔥 修正: file_io_controller → file_controller
-                    if hasattr(self.app, 'file_controller'): # 属性の存在チェックを追加
+                    if hasattr(self.app, 'file_controller'): 
                         self.app.file_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
                     else:
-                        # フォールバック：file_controllerが見つからない場合は直接_on_file_loadedを呼ぶ
-                        # ただし、これは通常発生しないはず
                         from PySide6.QtCore import QTimer
                         QTimer.singleShot(0, lambda: self.app._on_file_loaded(self.backend_instance, filepath, encoding))
-                    return # ここで終了
+                    return 
 
             elif load_mode == 'lazy':
                 self.backend_instance = LazyCSVLoader(filepath, encoding)
-                # プログレスダイアログを閉じるシグナルを確実にemit
                 self.file_loading_finished.emit()
                 
-                # 🔥 修正: file_io_controller → file_controller
-                if hasattr(self.app, 'file_controller'): # 属性の存在チェックを追加
+                if hasattr(self.app, 'file_controller'): 
                     self.app.file_controller.file_loaded.emit(self.backend_instance, filepath, encoding)
                 else:
-                    # フォールバック
                     from PySide6.QtCore import QTimer
                     QTimer.singleShot(0, lambda: self.app._on_file_loaded(self.backend_instance, filepath, encoding))
-                return # ここで終了
+                return 
 
-            else: # normal mode
-                # 通常モードの進捗表示を改善
+            else: 
                 self.file_loading_progress.emit("ファイルをメモリに読み込み中...", 0, 100)
                 
                 chunks = []
-                chunk_size = 10000 # 10,000行ずつ読み込み
+                chunk_size = 10000 
                 
                 try:
-                    # 最初に行数を高速カウント
-                    # _fast_line_countのような外部コマンドはfeatures.pyの依存関係を増やさないため避ける
-                    # ここではPython標準のsum(1 for _ in f)を使用
-                    with open(filepath, 'r', encoding=encoding, errors='ignore') as f: # errors='ignore'を追加
-                        total_lines = sum(1 for _ in f) # ヘッダー行を含む
-                        if total_lines > 0: # ヘッダー行を除くデータ行数
+                    with open(filepath, 'r', encoding=encoding, errors='ignore') as f: 
+                        total_lines = sum(1 for _ in f) 
+                        if total_lines > 0: 
                             total_data_lines = total_lines - 1
                         else:
                             total_data_lines = 0
 
-                    # チャンク読み込み
-                    # config.py から CSV_READ_OPTIONS を参照する
-                    read_options = self.app.file_controller.config.CSV_READ_OPTIONS.copy() # 🔥 修正: file_io_controller → file_controller
+                    # 🔥 修正前（エラーが発生）
+                    # read_options = self.app.file_controller.config.CSV_READ_OPTIONS.copy() 
+                    
+                    # 🔥 修正後（直接configモジュールを参照）
+                    read_options = config.CSV_READ_OPTIONS.copy()
                     read_options['encoding'] = encoding
 
-                    # 楽天市場CSVの特殊な処理 (file_io_controllerからも移行)
                     try:
                         with open(filepath, 'r', encoding=encoding) as f_peek:
                             first_line = f_peek.readline()
@@ -236,44 +218,41 @@ class AsyncDataManager(QObject):
                         pass
                         
                     reader = pd.read_csv(filepath, encoding=encoding, dtype=str,
-                                        chunksize=chunk_size, on_bad_lines='skip', **read_options) # 🔥 修正: errors → on_bad_lines
+                                        chunksize=chunk_size, on_bad_lines='skip', **read_options) 
                     
                     rows_read = 0
                     for i, chunk in enumerate(reader):
                         if self.is_cancelled:
                             break
                             
-                        chunks.append(chunk.fillna('')) # NaNを空文字列に変換
+                        chunks.append(chunk.fillna('')) 
                         rows_read += len(chunk)
                         
-                        # 進捗を正確に計算
                         if total_data_lines > 0:
-                            progress = min(int((rows_read / total_data_lines) * 100), 99) # 99%まで
+                            progress = min(int((rows_read / total_data_lines) * 100), 99) 
                         else:
-                            progress = 100 # データ行がない場合も100%に
+                            progress = 100 
                         self.file_loading_progress.emit(
                             f"データをメモリに読み込み中... ({rows_read:,}/{total_data_lines:,}行)", 
                             progress, 100
                         )
                     
                     if not self.is_cancelled:
-                        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=self.app.table_model._headers) # 空の場合のヘッダー考慮
+                        df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=self.app.table_model._headers) 
                         self.file_loading_progress.emit("読み込み完了", 100, 100)
                     
                 except Exception as e_chunk:
-                    # チャンク読み込みが失敗した場合は通常の読み込みにフォールバック
                     print(f"チャンク読み込みエラー、通常読み込みに切り替え (AsyncDataManager): {e_chunk}")
-                    df = pd.read_csv(filepath, encoding=encoding, dtype=str, on_bad_lines='skip').fillna('') # 🔥 修正: errors → on_bad_lines
+                    df = pd.read_csv(filepath, encoding=encoding, dtype=str, on_bad_lines='skip').fillna('') 
                     self.file_loading_progress.emit("読み込み完了", 100, 100)
                 
-                # プログレスダイアログを閉じるシグナルを確実にemit
                 self.file_loading_finished.emit()
 
                 if not self.is_cancelled:
                     self.data_ready.emit(df if df is not None else pd.DataFrame())
-                else: # normalモードでキャンセルされた場合
+                else: 
                     self.status_message_requested.emit("読み込みをキャンセルしました。", 3000, False)
-                    self.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
+                    self.cleanup_backend_requested.emit() 
                     self.show_welcome_requested.emit()
 
         except Exception as e:
@@ -281,14 +260,13 @@ class AsyncDataManager(QObject):
             print(f"ERROR in _do_load_full_df: {error_message}")
             traceback.print_exc()
             
-            # エラー時も必ずプログレスダイアログを閉じる
             self.file_loading_finished.emit()
             
-            self.task_progress.emit(f"エラー: {e}", 1, 1) # task_progressは従来のQProgressDialog向けだが、念のため
+            self.task_progress.emit(f"エラー: {e}", 1, 1) 
             self.status_message_requested.emit(error_message, 5000, True)
-            self.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+            self.cleanup_backend_requested.emit() 
             self.show_welcome_requested.emit()
-            self.data_ready.emit(pd.DataFrame()) # エラー時は空のDataFrameを送信
+            self.data_ready.emit(pd.DataFrame()) 
 
     def search_data_async(self, settings: dict, current_load_mode: str, parent_child_data: dict, selected_rows: set):
         self.is_cancelled = False
@@ -303,21 +281,18 @@ class AsyncDataManager(QObject):
         is_regex = settings["is_regex"]
         in_selection_only = settings["in_selection_only"]
         
-        results = [] # このresultsに最終的な (row_idx, col_idx) を追加する
+        results = [] 
         
         try:
             self.task_progress.emit("検索中...", 0, 0)
 
             if current_load_mode == 'sqlite':
-                # 🔥 修正: main_windowのdb_backendを直接参照
                 db_backend = self.app.db_backend if hasattr(self.app, 'db_backend') and self.app.db_backend else self.backend_instance
                 
                 if db_backend and hasattr(db_backend, 'search'):
                     print(f"DEBUG: SQLite検索開始 - backend: {db_backend}")
                     
-                    # db_backend.search は既に (row_idx, col_idx) を返すように修正済みなので、
-                    # そのままresultsに代入またはextendする
-                    raw_results_from_db = db_backend.search( # 変数名を変更
+                    raw_results_from_db = db_backend.search( 
                         search_term, 
                         target_columns, 
                         is_case_sensitive, 
@@ -325,14 +300,13 @@ class AsyncDataManager(QObject):
                     )
                     print(f"DEBUG: SQLite検索結果: {len(raw_results_from_db)}件")
                     
-                    # db_backend.searchからの結果は既に(row_idx, col_idx)形式なので、そのまま使用
-                    results.extend(raw_results_from_db) # 直接resultsに追加
+                    results.extend(raw_results_from_db) 
                 else:
                     print("ERROR: SQLiteバックエンドが見つかりません")
                     self.status_message_requested.emit("エラー: データベースが初期化されていません", 5000, True)
                     self.search_results_ready.emit([])
                     self.task_progress.emit("検索エラー", 1, 1)
-                    return # ここで終了
+                    return 
 
             elif current_load_mode == 'lazy':
                 if self.backend_instance:
@@ -342,13 +316,13 @@ class AsyncDataManager(QObject):
                             self.backend_instance.cancelled = True
                         self.task_progress.emit("ファイル内を検索中...", current, total_rows)
                     
-                    lazy_results = self.backend_instance.search_in_file( # 変数名を変更
+                    lazy_results = self.backend_instance.search_in_file( 
                         search_term, target_columns, is_case_sensitive, is_regex,
                         progress_callback=progress_callback
                     )
-                    results.extend(lazy_results) # 結果をresultsに追加
+                    results.extend(lazy_results) 
             
-            else: # normal mode (DataFrame in memory)
+            else: 
                 df = self.app.table_model._dataframe
                 if df is None or df.empty:
                     self.search_results_ready.emit([])
@@ -382,7 +356,7 @@ class AsyncDataManager(QObject):
                         if col_idx < len(df.columns):
                             cell_value = df.iat[row_idx, col_idx]
                             if cell_value is not None and pattern.search(str(cell_value)):
-                                results.append((row_idx, col_idx)) # normal modeの結果もresultsに追加
+                                results.append((row_idx, col_idx)) 
                         
                         processed_cells += 1
                         if processed_cells % 1000 == 0:
@@ -406,7 +380,7 @@ class AsyncDataManager(QObject):
             self.search_results_ready.emit([])
             return
         
-        self.search_results_ready.emit(results) # 最終的なresultsをemit
+        self.search_results_ready.emit(results) 
 
     def analyze_parent_child_async(self, db_backend_instance, column_name, mode):
         self.is_cancelled = False
@@ -438,14 +412,11 @@ class AsyncDataManager(QObject):
         status_message = ""
         
         try:
-            # (📋 統合改善案 - ここから追加)
-            # パラメータの検証
             required_params = ['lookup_filepath', 'lookup_file_encoding', 
                                'target_col', 'lookup_key_col', 'replace_val_col']
             missing_params = [p for p in required_params if p not in params]
             if missing_params:
                 raise KeyError(f"必須パラメータが不足: {missing_params}")
-            # (📋 統合改善案 - ここまで追加)
 
             self.task_progress.emit("参照ファイルを読み込み中...", 0, 1)
             lookup_df = pd.read_csv(params['lookup_filepath'], encoding=params['lookup_file_encoding'], dtype=str, on_bad_lines='warn').fillna('')
@@ -536,6 +507,294 @@ class AsyncDataManager(QObject):
         self.current_task.task_progress.connect(self.task_progress.emit)
         self.current_task.start()
 
+    def bulk_extract_async(self, data_source, settings, load_mode): 
+        """商品リスト一括抽出の非同期処理""" 
+        self.is_cancelled = False 
+        worker = Worker(self._do_bulk_extract, data_source, settings, load_mode) 
+        self.executor.submit(worker.run) 
+
+    def _do_bulk_extract(self, data_source, settings, load_mode, **kwargs): 
+        """商品リスト一括抽出/除外の実際の処理"""
+        try: 
+            target_column = settings['bulk_extract_column'] 
+            product_list = settings['product_list'] 
+            case_sensitive = settings['case_sensitive'] 
+            exact_match = settings['exact_match'] 
+            trim_whitespace = settings['trim_whitespace'] 
+            
+            # 🔥 新規追加：モード取得
+            bulk_mode = settings.get('bulk_mode', 'extract')  # デフォルトは抽出モード
+            
+            if trim_whitespace: 
+                product_list = [item.strip() for item in product_list] 
+            
+            unique_products = list(set(product_list)) 
+            
+            if not case_sensitive: 
+                search_dict = {item.lower(): item for item in unique_products} 
+                search_keys = set(search_dict.keys()) 
+            else: 
+                search_keys = set(unique_products) 
+            
+            self.task_progress.emit("商品リストを解析中...", 10, 100) 
+            
+            matched_rows_indices = [] 
+            
+            # 各モードでマッチング処理を実行
+            if load_mode == 'sqlite' and hasattr(data_source, 'conn'): 
+                matched_rows_indices = self._bulk_extract_from_sqlite( 
+                    data_source, target_column, search_keys, case_sensitive, exact_match 
+                ) 
+            elif load_mode == 'lazy' and hasattr(data_source, 'filepath'): 
+                matched_rows_indices = self._bulk_extract_from_lazy_loader( 
+                    data_source, target_column, search_keys, case_sensitive, exact_match 
+                ) 
+            else: 
+                if hasattr(data_source, 'get_dataframe'): 
+                    df = data_source.get_dataframe() 
+                else: 
+                    df = data_source 
+                
+                matched_rows_indices = self._bulk_extract_from_dataframe( 
+                    df, target_column, search_keys, case_sensitive, exact_match 
+                ) 
+            
+            # 🔥 重要：除外モードの場合、マッチしなかった行を取得
+            if bulk_mode == 'exclude':
+                # 全行のインデックスを取得
+                if load_mode == 'sqlite' or load_mode == 'lazy':
+                    total_rows = data_source.get_total_rows()
+                    all_indices = list(range(total_rows))
+                else:
+                    all_indices = list(range(len(df)))
+                
+                # マッチした行を除外
+                matched_set = set(matched_rows_indices)
+                excluded_rows_indices = [idx for idx in all_indices if idx not in matched_set]
+                
+                # 結果を入れ替え
+                matched_rows_indices = excluded_rows_indices
+            
+            # 結果の処理
+            if matched_rows_indices:
+                if load_mode == 'sqlite' or load_mode == 'lazy':
+                    result_df = data_source.get_rows_by_ids(matched_rows_indices)
+                    if hasattr(data_source, 'header') and not result_df.empty:
+                        result_df = result_df[data_source.header]
+                else:
+                    result_df = df.iloc[matched_rows_indices].copy().reset_index(drop=True)
+                
+                if bulk_mode == 'extract':
+                    status_message = f"商品リスト抽出完了: {len(matched_rows_indices)}件の商品が見つかりました（検索対象: {len(unique_products)}件）"
+                else:
+                    status_message = f"商品リスト除外完了: {len(matched_rows_indices)}件の商品が残りました（除外対象: {len(unique_products)}件）"
+            else:
+                result_df = pd.DataFrame(columns=self.app.table_model._headers)
+                if bulk_mode == 'extract':
+                    status_message = f"該当する商品が見つかりませんでした（検索対象: {len(unique_products)}件）"
+                else:
+                    status_message = f"すべての商品が除外されました（除外対象: {len(unique_products)}件）"
+            
+            self.task_progress.emit("処理完了", 100, 100)
+            self.bulk_extract_completed.emit(result_df, status_message)
+            
+        except Exception as e:
+            error_message = f"商品リスト処理中にエラーが発生しました: {str(e)}"
+            print(f"ERROR in _do_bulk_extract: {error_message}")
+            traceback.print_exc()
+            self.bulk_extract_completed.emit(pd.DataFrame(), error_message)
+
+    def _bulk_extract_from_sqlite(self, db_backend, target_column, search_keys, case_sensitive, exact_match): 
+        """SQLiteバックエンドからの商品リスト抽出（一時テーブル+JOIN最適化）""" 
+        matched_rows_indices = [] 
+        
+        try: 
+            escaped_col = target_column.replace('"', '""') 
+            cursor = db_backend.conn.cursor() 
+            
+            cursor.execute("CREATE TEMPORARY TABLE temp_lookup (value TEXT PRIMARY KEY)") 
+            
+            search_list = list(search_keys) 
+            if len(search_list) > 10000: 
+                for i in range(0, len(search_list), 10000): 
+                    if self.is_cancelled: return [] 
+                    chunk = search_list[i:i+10000] 
+                    cursor.executemany("INSERT OR IGNORE INTO temp_lookup (value) VALUES (?)", 
+                                      [(item,) for item in chunk]) 
+                    self.task_progress.emit(f"検索リストをDBにロード中... ({i + len(chunk)}/{len(search_list)})", 20 + int((i + len(chunk)) / len(search_list) * 20), 100) 
+            else: 
+                cursor.executemany("INSERT INTO temp_lookup (value) VALUES (?)", 
+                                  [(item,) for item in search_list]) 
+            db_backend.conn.commit() 
+            
+            if exact_match: 
+                if case_sensitive: 
+                    query = f'''
+                    SELECT T1.rowid - 1 FROM "{db_backend.table_name}" AS T1
+                    JOIN temp_lookup AS T2 ON T1."{escaped_col}" = T2.value
+                    ''' 
+                else: 
+                    query = f'''
+                    SELECT T1.rowid - 1 FROM "{db_backend.table_name}" AS T1
+                    JOIN temp_lookup AS T2 ON LOWER(T1."{escaped_col}") = LOWER(T2.value)
+                    ''' 
+            else: 
+                if case_sensitive: 
+                    query = f'''
+                    SELECT T1.rowid - 1 FROM "{db_backend.table_name}" AS T1
+                    JOIN temp_lookup AS T2 ON T1."{escaped_col}" LIKE '%' || T2.value || '%'
+                    ''' 
+                else: 
+                    query = f'''
+                    SELECT T1.rowid - 1 FROM "{db_backend.table_name}" AS T1
+                    JOIN temp_lookup AS T2 ON LOWER(T1."{escaped_col}") LIKE '%' || LOWER(T2.value) || '%'
+                    ''' 
+            
+            cursor.execute(query) 
+            
+            chunk_size = 50000 
+            total_processed_rows = 0 
+            
+            while True: 
+                if self.is_cancelled: 
+                    matched_rows_indices = [] 
+                    break 
+                
+                rows_chunk = cursor.fetchmany(chunk_size) 
+                if not rows_chunk: 
+                    break 
+                
+                matched_rows_indices.extend([row[0] for row in rows_chunk]) 
+                total_processed_rows += len(rows_chunk) 
+                self.task_progress.emit(f"商品を検索中... {total_processed_rows}件発見", 40 + int(total_processed_rows / db_backend.get_total_rows() * 40), 100) 
+                
+            cursor.execute("DROP TABLE IF EXISTS temp_lookup") 
+            
+            self.task_progress.emit(f"商品を検索中... {len(matched_rows_indices)}件発見", 90, 100) 
+            
+        except Exception as e: 
+            print(f"ERROR in _bulk_extract_from_sqlite: {e}") 
+            try: 
+                cursor.execute("DROP TABLE IF EXISTS temp_lookup") 
+            except: 
+                pass 
+            raise 
+        
+        return matched_rows_indices 
+
+    def _bulk_extract_from_dataframe(self, df, target_column, search_keys, case_sensitive, exact_match): 
+        """DataFrameからの商品リスト抽出""" 
+        matched_rows_indices = [] 
+        
+        try: 
+            if target_column not in df.columns: 
+                return matched_rows_indices 
+            
+            target_series = df[target_column].astype(str).fillna('') 
+            
+            total_rows = len(df) 
+            processed_rows = 0 
+            
+            if exact_match: 
+                if case_sensitive: 
+                    mask = target_series.isin(search_keys) 
+                else: 
+                    mask = target_series.str.lower().isin(search_keys) 
+            else: 
+                if case_sensitive: 
+                    pattern_str = '|'.join(re.escape(item) for item in search_keys) 
+                    if len(pattern_str) > 10000: 
+                        chunk_size = 500 
+                        masks = [] 
+                        for i in range(0, len(search_keys), chunk_size): 
+                            if self.is_cancelled: return [] 
+                            sub_pattern_str = '|'.join(re.escape(item) for item in list(search_keys)[i:i+chunk_size]) 
+                            masks.append(target_series.str.contains(sub_pattern_str, regex=True, na=False)) 
+                            self.task_progress.emit(f"部分一致検索中... ({i + chunk_size}/{len(search_keys)}キー)", 40 + int((i + chunk_size) / len(search_keys) * 10), 100) 
+                        mask = masks[0] 
+                        for m in masks[1:]: 
+                            mask |= m 
+                    else: 
+                        mask = target_series.str.contains(pattern_str, regex=True, na=False) 
+                else: 
+                    pattern_str = '|'.join(re.escape(item) for item in search_keys) 
+                    if len(pattern_str) > 10000: 
+                        chunk_size = 500 
+                        masks = [] 
+                        for i in range(0, len(search_keys), chunk_size): 
+                            if self.is_cancelled: return [] 
+                            sub_pattern_str = '|'.join(re.escape(item) for item in list(search_keys)[i:i+chunk_size]) 
+                            masks.append(target_series.str.contains(sub_pattern_str, case=False, regex=True, na=False)) 
+                            self.task_progress.emit(f"部分一致検索中... ({i + chunk_size}/{len(search_keys)}キー)", 40 + int((i + chunk_size) / len(search_keys) * 10), 100) 
+                        mask = masks[0] 
+                        for m in masks[1:]: 
+                            mask |= m 
+                    else: 
+                        mask = target_series.str.contains(pattern_str, case=False, regex=True, na=False) 
+            
+            matched_rows_indices = df[mask].index.tolist() 
+            
+            self.task_progress.emit(f"商品を検索中... {len(matched_rows_indices)}件発見", 90, 100) 
+            
+        except Exception as e: 
+            print(f"ERROR in _bulk_extract_from_dataframe: {e}") 
+            raise 
+        
+        return matched_rows_indices 
+
+    def _bulk_extract_from_lazy_loader(self, lazy_loader, target_column, search_keys, case_sensitive, exact_match): 
+        """LazyCSVLoaderからの商品リスト抽出""" 
+        matched_rows_indices = [] 
+        col_idx = lazy_loader.header.index(target_column) 
+        
+        if exact_match: 
+            if case_sensitive: 
+                match_func = lambda cell_val: cell_val in search_keys 
+            else: 
+                search_keys_lower = {k.lower() for k in search_keys} 
+                match_func = lambda cell_val: cell_val.lower() in search_keys_lower 
+        else: 
+            if case_sensitive: 
+                patterns = [re.compile(re.escape(key)) for key in search_keys] 
+                match_func = lambda cell_val: any(p.search(cell_val) for p in patterns) 
+            else: 
+                patterns = [re.compile(re.escape(key), re.IGNORECASE) for key in search_keys] 
+                match_func = lambda cell_val: any(p.search(cell_val) for p in patterns) 
+
+        total_rows = lazy_loader.get_total_rows() 
+        
+        try: 
+            with lazy_loader._file_lock: 
+                if lazy_loader._file_handle is None: 
+                    lazy_loader._file_handle = open(lazy_loader.filepath, 'r', 
+                                                    encoding=lazy_loader.encoding, 
+                                                    errors='ignore', newline='') 
+                    lazy_loader._file_handle.readline() 
+                
+                lazy_loader._file_handle.seek(lazy_loader._row_index[0] if lazy_loader._row_index else 0) 
+                
+                for row_idx in range(total_rows): 
+                    if self.is_cancelled: return [] 
+                    
+                    line = lazy_loader._file_handle.readline() 
+                    if not line: break 
+                    
+                    parsed_row = lazy_loader._parse_csv_line(line) 
+                    
+                    if col_idx < len(parsed_row): 
+                        cell_value = parsed_row[col_idx] 
+                        if match_func(cell_value): 
+                            matched_rows_indices.append(row_idx) 
+                    
+                    if row_idx % 1000 == 0: 
+                        self.task_progress.emit(f"Lazyロードで検索中... ({row_idx}/{total_rows})", 40 + int(row_idx / total_rows * 40), 100) 
+            
+        except Exception as e: 
+            print(f"ERROR in _bulk_extract_from_lazy_loader: {e}") 
+            raise 
+        
+        return matched_rows_indices 
+
 class ProductDiscountTask(QThread):
     """商品別割引適用をバックグラウンドで実行するQThreadベースのタスク"""
     discount_completed = Signal(list, str)
@@ -568,7 +827,6 @@ class ProductDiscountTask(QThread):
         try:
             self.task_progress.emit("参照ファイルを読み込み中...", 0, 100)
             
-            # 使用するエンコーディングはparamsから取得 (SearchWidgetで既に検出されていることを想定)
             discount_file_encoding = self.params.get('discount_file_encoding', 'utf-8') 
             
             discount_df = pd.read_csv(
@@ -676,7 +934,7 @@ class ProductDiscountTask(QThread):
                         continue
                         
                     discount_rate = Decimal(str(discount_lookup[product_id]))
-                    discounted_price_decimal = Decimal('1.0') - discount_rate # 割引率を乗数に変換
+                    discounted_price_decimal = Decimal('1.0') - discount_rate 
                     final_price_decimal = Decimal(str(current_price)) * discounted_price_decimal
                     
                     final_price = self._apply_rounding(float(final_price_decimal), self.params['round_mode'])
@@ -731,7 +989,7 @@ class ProductDiscountTask(QThread):
                             continue
                             
                         discount_rate = Decimal(str(discount_lookup[product_id]))
-                        discounted_price_decimal = Decimal('1.0') - discount_rate # 割引率を乗数に変換
+                        discounted_price_decimal = Decimal('1.0') - discount_rate 
                         final_price_decimal = Decimal(str(current_price)) * discounted_price_decimal
                         
                         final_price = self._apply_rounding(float(final_price_decimal), self.params['round_mode'])
@@ -742,7 +1000,7 @@ class ProductDiscountTask(QThread):
                                 'row_idx': idx,
                                 'col_name': price_col,
                                 'new_value': final_price_str,
-                                'old_value': current_price_str # Undoのために旧値も保存
+                                'old_value': current_price_str 
                             })
                             
                     except Exception as e:
@@ -753,13 +1011,7 @@ class ProductDiscountTask(QThread):
                     self.task_progress.emit(f"DBデータを処理中... ({idx}/{total_rows})", 50 + int(idx/total_rows * 40), 100)
 
             if changes:
-                # この changes は {row_idx, col_name, new_value, old_value} 形式。
-                # Undo履歴に追加するために {item, column, old, new} 形式に変換する必要がある。
-                # しかし、ここではDBの更新のみを行い、Undo履歴への追加は main_qt.py で行うのが適切。
-                # main_qt.py (_on_product_discount_completed) で changes を受け取り、Undo Manager に追加するようにする。
                 self.backend.update_cells(changes)
-                # layoutChanged.emit() は main_qt.py で_on_product_discount_completed の後に呼ばれるため、ここでは不要。
-                # self.table_model.layoutChanged.emit() 
                 
         except Exception as e:
             print(f"ERROR: _process_with_backend failed: {e}")
@@ -798,12 +1050,10 @@ class ProductDiscountTask(QThread):
         if self.backend_instance and hasattr(self.backend_instance, 'close'):
             self.backend_instance.close()
 
-#==============================================================================
-# 2. その他の機能管理クラス
-#==============================================================================
-class UndoRedoManager:
+class UndoRedoManager(QObject):
     """操作履歴を管理し、アンドゥ/リドゥ機能を提供するクラス"""
     def __init__(self, app, max_history=50):
+        super().__init__()
         self.app = app
         self.history = []
         self.current_index = -1
@@ -839,13 +1089,14 @@ class UndoRedoManager:
         return self.current_index >= 0
 
     def can_redo(self):
+        """やり直し可能かどうかを判定"""
         return self.current_index < len(self.history) - 1
-
+    
     def clear(self):
-        self.history.clear()
+        """履歴をクリア"""
+        self.history = []
         self.current_index = -1
-        if hasattr(self.app, 'update_menu_states'):
-            self.app.update_menu_states()
+
 
 class CSVFormatManager:
     """CSV形式の判定と管理を行うクラス (現在は主にプレースホルダー)"""

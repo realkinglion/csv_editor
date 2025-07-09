@@ -172,109 +172,161 @@ class SQLiteBackend:
             self.sort_info = {'column': column_name, 'order': order}
 
     def search(self, search_term, columns=None, case_sensitive=True, is_regex=False):
-        """データベース内を検索（正規表現対応・チャンク処理版）"""
+        """最適化された複数列検索"""
         print(f"DEBUG: SQLite search - term: '{search_term}', columns: {columns}, case_sensitive: {case_sensitive}, is_regex: {is_regex}")
         
         # デバッグ用データ検証（一時的に有効化して確認後、コメントアウトまたは削除推奨）
         # self.debug_data_verification() 
         
         if not columns:
-            cursor = self.conn.execute(f"PRAGMA table_info({self.table_name})")
-            columns = [row[1] for row in cursor]
+            columns = self.header
             print(f"DEBUG: 検索対象列数: {len(columns)}")
         
-        search_results = []
-        total_rows = self.get_total_rows()
-        chunk_size = 50000
+        # 列数による処理方法の最適化
+        if len(columns) > 20:
+            chunk_size = 10000  # 大量列の場合はチャンクサイズを調整
+        else:
+            chunk_size = 50000
         
         if is_regex:
-            import re
-            try:
-                flags = 0
-                if not case_sensitive:
-                    flags |= re.IGNORECASE
-                if '^' in search_term or '$' in search_term:
-                    flags |= re.MULTILINE
-                pattern = re.compile(search_term, flags)
-                
-                # チャンクごとにデータを読み込み、Pandasで正規表現検索
-                for offset in range(0, total_rows, chunk_size):
-                    if hasattr(self, 'cancelled') and self.cancelled:
-                        break
-                    
-                    limit = min(chunk_size, total_rows - offset)
-                    
-                    # 検索対象列とrowidのみを読み込むクエリを生成
-                    select_cols_quoted = []
-                    valid_target_columns = [col for col in columns if col in self.header]
-                    for col in valid_target_columns:
-                        escaped_col = col.replace('"', '""')
-                        select_cols_quoted.append(f'"{escaped_col}"')
-                    
-                    if not select_cols_quoted:
-                        print("WARNING: 検索対象の有効な列がありません。")
-                        continue
-                    
-                    # SQLクエリ（コメントなし）
-                    query = f'''
-                        SELECT rowid, {", ".join(select_cols_quoted)}
-                        FROM {self.table_name}
-                        LIMIT {limit} OFFSET {offset}
-                    '''
-                    
-                    chunk_df = pd.read_sql_query(query, self.conn)
-                    if chunk_df.empty:
-                        continue
-                    
-                    # Pandasのstr.containsで高速正規表現マッチング
-                    for col_name in valid_target_columns:
-                        if col_name in chunk_df.columns:
-                            matched_mask = chunk_df[col_name].astype(str).str.contains(pattern, na=False, regex=True)
-                            
-                            if matched_mask.any():
-                                for idx in chunk_df[matched_mask].index:
-                                    rowid = chunk_df.loc[idx, 'rowid']
-                                    # 列名から列インデックスを正確に取得
-                                    col_idx = self.header.index(col_name) if col_name in self.header else 0
-                                    search_results.append((rowid - 1, col_idx)) # rowidは1から始まるため-1する
-                    
-                    # 進捗通知
-                    if hasattr(self, 'app') and hasattr(self.app, 'async_manager'):
-                        progress_value = min(100, int(((offset + limit) / total_rows) * 100))
-                        status = f"正規表現検索中... ({offset + limit:,}/{total_rows:,}行)"
-                        try:
-                            self.app.async_manager.task_progress.emit(status, progress_value, 100)
-                        except:
-                            pass
-                
-            except re.error as e:
-                print(f"正規表現エラー: {e}")
-                return []
-        else: # is_regex == False
-            # シンプルなLIKE検索 (既存ロジックを維持)
-            like_term = f'%{search_term}%'
-            
-            for col_name in columns:
-                if col_name not in self.header:
-                    continue
-                
-                escaped_col_name = col_name.replace('"', '""')
-                
-                if case_sensitive:
-                    query = f'SELECT rowid - 1 FROM {self.table_name} WHERE "{escaped_col_name}" LIKE ?'
-                    params = [like_term]
-                else:
-                    query = f'SELECT rowid - 1 FROM {self.table_name} WHERE LOWER("{escaped_col_name}") LIKE LOWER(?)'
-                    params = [like_term]
-                
-                try:
-                    cursor = self.conn.execute(query, params)
-                    col_idx = self.header.index(col_name) if col_name in self.header else 0 # 列名から列インデックスを取得
-                    for row in cursor:
-                        search_results.append((row[0], col_idx)) # (row_index, column_index)形式で追加
-                except sqlite3.OperationalError as e:
-                    print(f"ERROR: 列 '{col_name}' の検索エラー: {e}")
+            return self._search_regex_optimized(search_term, columns, case_sensitive, chunk_size)
+        else:
+            return self._search_like_optimized(search_term, columns, case_sensitive)
+
+    def _search_like_optimized(self, search_term, columns, case_sensitive):
+        """LIKE検索の最適化（UNION ALL使用）"""
+        search_results = []
+        like_term = f'%{search_term}%'
         
+        # 複数列をUNION ALLで効率的に検索
+        union_queries = []
+        params = []
+        
+        for col_name in columns:
+            if col_name not in self.header:
+                continue
+            
+            col_idx = self.header.index(col_name)
+            escaped_col_name = col_name.replace('"', '""')
+            
+            if case_sensitive:
+                condition = f'"{escaped_col_name}" LIKE ?'
+            else:
+                condition = f'LOWER("{escaped_col_name}") LIKE LOWER(?)'
+            
+            union_queries.append(f"""
+                SELECT rowid - 1 as row_idx, {col_idx} as col_idx
+                FROM {self.table_name}
+                WHERE {condition}
+            """)
+            params.append(like_term)
+        
+        if union_queries:
+            full_query = " UNION ALL ".join(union_queries)
+            try:
+                cursor = self.conn.execute(full_query, params)
+                search_results = [(row[0], row[1]) for row in cursor]
+            except sqlite3.OperationalError as e:
+                print(f"ERROR: 複数列検索エラー: {e}")
+                # フォールバック処理
+                return self._search_like_fallback(search_term, columns, case_sensitive)
+        
+        return search_results
+
+    def _search_like_fallback(self, search_term, columns, case_sensitive):
+        """UNION ALLが失敗した場合のフォールバック処理（既存の単一列検索をループ）"""
+        search_results = []
+        like_term = f'%{search_term}%'
+        
+        for col_name in columns:
+            if col_name not in self.header:
+                continue
+            
+            escaped_col_name = col_name.replace('"', '""')
+            
+            if case_sensitive:
+                query = f'SELECT rowid - 1 FROM {self.table_name} WHERE "{escaped_col_name}" LIKE ?'
+                params = [like_term]
+            else:
+                query = f'SELECT rowid - 1 FROM {self.table_name} WHERE LOWER("{escaped_col_name}") LIKE LOWER(?)'
+                params = [like_term]
+            
+            try:
+                cursor = self.conn.execute(query, params)
+                col_idx = self.header.index(col_name) if col_name in self.header else 0 # 列名から列インデックスを取得
+                for row in cursor:
+                    search_results.append((row[0], col_idx)) # (row_index, column_index)形式で追加
+            except sqlite3.OperationalError as e:
+                print(f"ERROR: 列 '{col_name}' の検索エラー (フォールバック): {e}")
+        return search_results
+
+    def _search_regex_optimized(self, search_term, columns, case_sensitive, chunk_size):
+        """正規表現検索の最適化（Pandasチャンク処理）"""
+        search_results = []
+        total_rows = self.get_total_rows()
+
+        import re
+        try:
+            flags = 0
+            if not case_sensitive:
+                flags |= re.IGNORECASE
+            if '^' in search_term or '$' in search_term:
+                flags |= re.MULTILINE
+            pattern = re.compile(search_term, flags)
+        except re.error as e:
+            print(f"正規表現エラー: {e}")
+            return []
+        
+        valid_target_columns = [col for col in columns if col in self.header]
+        if not valid_target_columns:
+            print("WARNING: 検索対象の有効な列がありません。")
+            return []
+
+        # チャンクごとにデータを読み込み、Pandasで正規表現検索
+        for offset in range(0, total_rows, chunk_size):
+            if hasattr(self, 'cancelled') and self.cancelled:
+                break
+            
+            limit = min(chunk_size, total_rows - offset)
+            
+            # 検索対象列とrowidのみを読み込むクエリを生成
+            select_cols_quoted = []
+            for col in valid_target_columns:
+                escaped_col = col.replace('"', '""')
+                select_cols_quoted.append(f'"{escaped_col}"')
+            
+            # SQLクエリ
+            query = f'''
+                SELECT rowid, {", ".join(select_cols_quoted)}
+                FROM {self.table_name}
+                LIMIT {limit} OFFSET {offset}
+            '''
+            
+            chunk_df = pd.read_sql_query(query, self.conn)
+            if chunk_df.empty:
+                continue
+            
+            # Pandasのstr.containsで高速正規表現マッチング
+            for col_name in valid_target_columns:
+                if col_name in chunk_df.columns:
+                    matched_mask = chunk_df[col_name].astype(str).str.contains(pattern, na=False, regex=True)
+                    
+                    if matched_mask.any():
+                        for idx in chunk_df[matched_mask].index:
+                            rowid = chunk_df.loc[idx, 'rowid']
+                            # 列名から列インデックスを正確に取得
+                            col_idx = self.header.index(col_name) if col_name in self.header else 0
+                            search_results.append((rowid - 1, col_idx)) # rowidは1から始まるため-1する
+            
+            # 進捗通知
+            if hasattr(self, 'app') and hasattr(self.app, 'async_manager'):
+                progress_value = min(100, int(((offset + limit) / total_rows) * 100))
+                status = f"正規表現検索中... ({offset + limit:,}/{total_rows:,}行)"
+                try:
+                    self.app.async_manager.task_progress.emit(status, progress_value, 100)
+                except:
+                    pass
+                
         print(f"DEBUG: 検索完了 - 合計 {len(search_results)} 件")
         return search_results
 
@@ -292,7 +344,6 @@ class SQLiteBackend:
         print(f"DEBUG: execute_replace_all_in_db called with settings: {settings}")
         
         if not search_term or not target_columns:
-            # 🔥 修正: 変更履歴も返すように変更
             return False, 0, []
         
         # 正規表現パターンの事前コンパイル（重要な最適化）
@@ -309,7 +360,6 @@ class SQLiteBackend:
                                      0 if is_case_sensitive else re.IGNORECASE)
         except re.error as e:
             print(f"正規表現エラー: {e}")
-            # 🔥 修正: 変更履歴も返すように変更
             return False, 0, []
         
         total_rows = self.get_total_rows()

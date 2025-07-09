@@ -4,15 +4,24 @@ import os
 import csv
 import pandas as pd
 import traceback
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QApplication, QProgressDialog, QDialog, QVBoxLayout, QRadioButton, QPushButton, QLabel, QDialogButtonBox, QInputDialog
-from PySide6.QtCore import QObject, Signal, Qt, QTimer
-
+from PySide6.QtWidgets import (
+    QFileDialog, QMessageBox, QApplication, QProgressDialog,
+    QDialog, QVBoxLayout, QRadioButton, QPushButton,
+    QLabel, QDialogButtonBox, QInputDialog
+)
+from PySide6.QtCore import QObject, Signal, Qt, QTimer, QModelIndex # QModelIndex を追加
 import config
+
+# 🔥 修正: dialogs.pyからのEncodingSaveDialog, CSVSaveFormatDialog, NewFileDialogを明示的にインポート
 from dialogs import EncodingSaveDialog, CSVSaveFormatDialog, NewFileDialog
 import re
 import psutil
 from threading import Thread
 
+# main_qt.py をインポート (CsvEditorAppQt を参照するため)
+# ただし、循環参照を避けるため、必要な関数やクラスのみをインポートするか、
+# 関数内で遅延インポートを検討する。ここでは CsvEditorAppQt クラス全体が必要なので
+# メソッド内で遅延インポートを試みる。
 
 class FileIOController(QObject):
     """ファイルI/O操作を管理するコントローラー"""
@@ -27,14 +36,38 @@ class FileIOController(QObject):
         super().__init__()
         self.main_window = main_window # CsvEditorAppQtのインスタンス
         self.current_load_mode = 'normal'
+
+    def _is_welcome_screen_active(self):
+        """ウェルカム画面が表示されており、かつデータがロードされていない状態かを正確に判定するヘルパーメソッド"""
+        # 🔥 重要：複数の条件で正確に判定
+        welcome_visible = (
+            hasattr(self.main_window, 'welcome_widget') and 
+            self.main_window.welcome_widget.isVisible()
+        )
+        
+        view_stack_hidden = (
+            hasattr(self.main_window, 'view_stack') and 
+            self.main_window.main_window_is_initialized and # ui_main_window.py の setupUi が完了していることを保証
+            self.main_window.view_stack.isHidden()
+        )
+        
+        # table_model の rowCount() が 0 であること
+        no_data = self.main_window.table_model.rowCount() == 0
+        
+        result = welcome_visible and view_stack_hidden and no_data
+        print(f"DEBUG: ウェルカム画面判定 - welcome_visible: {welcome_visible}, "
+              f"view_stack_hidden: {view_stack_hidden}, no_data: {no_data} → {result}")
+        
+        return result
         
     def open_file(self, filepath=None):
-        """CSVファイルを開く"""
+        """CSVファイルを開く（ウェルカム画面考慮版）"""
         print("DEBUG: FileIOController.open_file called.")
         
         if not filepath:
+            # ファイル選択ダイアログから選択
             filepath_tuple = QFileDialog.getOpenFileName(
-                self.main_window, # 親ウィジェットとしてmain_windowを指定
+                self.main_window,
                 "CSVファイルを開く",
                 "",
                 "CSVファイル (*.csv);;テキストファイル (*.txt);;すべてのファイル (*.*)"
@@ -42,22 +75,78 @@ class FileIOController(QObject):
             if not filepath_tuple[0]:
                 return None
             filepath = filepath_tuple[0]
+            
+        print(f"DEBUG: ファイルを開く処理を開始: {filepath}")
         
-        # 既存のバックエンドをクリーンアップ
-        self.main_window._cleanup_backend()
-        
-        # AsyncDataManagerにファイル読み込みを委譲する前の初期進捗通知
-        # ローディング開始を通知（UIスレッドで即座に実行）
-        self.main_window.file_loading_started.emit()
-
-        # ファイル読み込みプロセスを非同期で開始
-        QTimer.singleShot(50, lambda: self._start_file_loading_process(filepath))
+        # 🔥 修正のポイント：ウェルカム画面の状態を正確に判定
+        if self._is_welcome_screen_active():
+            # ウェルカム画面の場合 → 既存ウィンドウで開く
+            print("DEBUG: ウェルカム画面状態のため、既存ウィンドウで開きます")
+            self._start_file_loading_process(filepath)
+            return filepath
+        else:
+            # 既にデータがある場合 → 新しいウィンドウで開く
+            print("DEBUG: 既存データがあるため、新しいウィンドウで開きます")
+            
+            # 🔥 改善：確認ダイアログでユーザビリティ向上
+            # open_new_window_with_fileが filepathの存在チェックをしているため、ここでは不要
+            reply = QMessageBox.question(
+                self.main_window,
+                "新しいウィンドウで開く",
+                f"'{os.path.basename(filepath)}' を新しいウィンドウで開きます。\n"
+                f"現在の作業内容は保持されます。\n\n"
+                f"続行しますか？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.No:
+                return None
+            
+            # 新しいウィンドウで開く
+            self.main_window.open_new_window_with_file(filepath)
+            return filepath
     
     # ファイル読み込みプロセスを開始するラッパーメソッド
     def _start_file_loading_process(self, filepath):
         # UIスレッドをブロックしないように、ここでの重い処理はAsyncDataManagerに委譲
 
         try:
+            # 🔥 改善: ファイル存在確認とパーミッションエラーハンドリング
+            if not os.path.exists(filepath):
+                QMessageBox.critical(
+                    self.main_window, 
+                    "ファイルエラー", 
+                    f"指定されたファイルが見つかりません:\n{filepath}"
+                )
+                self.main_window.view_controller.show_welcome_screen() # エラー時はウェルカム画面に戻す
+                self.main_window.async_manager.cleanup_backend_requested.emit()
+                return None
+            
+            try:
+                # ファイルの読み込み可能性を確認（実際には読み込まない）
+                with open(filepath, 'rb') as f:
+                    pass
+            except PermissionError:
+                QMessageBox.critical(
+                    self.main_window,
+                    "アクセス権限エラー",
+                    f"ファイルにアクセスする権限がありません:\n{filepath}"
+                )
+                self.main_window.view_controller.show_welcome_screen() # エラー時はウェルカム画面に戻す
+                self.main_window.async_manager.cleanup_backend_requested.emit()
+                return None
+            except Exception as e:
+                QMessageBox.critical(
+                    self.main_window,
+                    "予期しないエラー",
+                    f"ファイル準備中にエラーが発生しました:\n{str(e)}\n\n詳細:\n{traceback.format_exc()}"
+                )
+                self.main_window.view_controller.show_welcome_screen() # エラー時はウェルカム画面に戻す
+                self.main_window.async_manager.cleanup_backend_requested.emit()
+                return None
+
+
             # エンコーディング検出の進捗通知
             self.main_window.file_loading_progress.emit(
                 "エンコーディングを検出中...", 0, 3
@@ -85,8 +174,7 @@ class FileIOController(QObject):
 
             selected_mode = 'normal' # デフォルトは通常モード
 
-            # 🔥 修正: 小さいファイルはモード選択ダイアログをスキップして直接非同期読み込みを開始
-            if file_size_mb <= config.PERFORMANCE_MODE_THRESHOLD / 1000:
+            if file_size_mb <= config.FILE_SIZE_MODE_SELECTION_THRESHOLD_MB:
                 print(f"DEBUG: 小さいファイル({file_size_mb:.2f}MB)のため通常モードで直接読み込み")
                 selected_mode = 'normal' # 小さいファイルは強制的に通常モード
             else:
@@ -104,12 +192,12 @@ class FileIOController(QObject):
                 lazy_radio = QRadioButton("遅延読み込みモード (巨大ファイル用)")
                 
                 # ファイルサイズに応じたデフォルト選択
-                if file_size_mb > 100 or not memory_ok: # 100MB以上またはメモリ不足の場合はSQLiteを推奨
+                if file_size_mb > 100 or not memory_ok:
                     sqlite_radio.setChecked(True)
                     if not memory_ok:
                         QMessageBox.warning(self.main_window, "メモリ不足",
                                             f"{memory_msg}\nSQLiteモードを推奨します。")
-                else: # 閾値超～100MB未満は通常モードをデフォルト
+                else:
                     normal_radio.setChecked(True)
                     
                 layout.addWidget(normal_radio)
@@ -129,24 +217,21 @@ class FileIOController(QObject):
                     else:
                         selected_mode = 'normal'
                 else:
-                    # 🔥 修正: キャンセル時の処理
                     self.main_window.show_operation_status("ファイルの読み込みをキャンセルしました。", 3000)
-                    # プログレスダイアログが表示されている場合は閉じる
                     if hasattr(self.main_window, 'progress_dialog') and self.main_window.progress_dialog is not None:
                         self.main_window._close_progress_dialog()
-                    # ローディングオーバーレイも閉じる
                     if hasattr(self.main_window, 'loading_overlay') and self.main_window.loading_overlay.isVisible():
                         self.main_window.loading_overlay.hide()
-                    self.main_window.view_controller.show_welcome_screen() # ウェルカム画面に戻る
-                    self.main_window.async_manager.cleanup_backend_requested.emit() # キャンセル時もクリーンアップ
+                    self.main_window.view_controller.show_welcome_screen()
+                    self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
                     return None
             
             self.current_load_mode = selected_mode
-            self.load_mode_changed.emit(self.current_load_mode) # シグナルを発行
+            self.load_mode_changed.emit(self.current_load_mode)
 
             # AsyncDataManager経由でのファイル読み込みを開始
             self.main_window.async_manager.load_full_dataframe_async(
-                filepath, encoding, selected_mode # selected_mode を渡す
+                filepath, encoding, selected_mode
             )
             
         except pd.errors.ParserError as e:
@@ -160,7 +245,7 @@ class FileIOController(QObject):
             ))
             QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
             self.main_window.file_loading_finished.emit()
-            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+            self.main_window.async_manager.cleanup_backend_requested.emit()
         except MemoryError:
             print("ERROR: メモリ不足")
             QTimer.singleShot(0, lambda: QMessageBox.critical(
@@ -171,11 +256,10 @@ class FileIOController(QObject):
             ))
             QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
             self.main_window.file_loading_finished.emit()
-            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+            self.main_window.async_manager.cleanup_backend_requested.emit()
         except Exception as e:
             print(f"ERROR: 予期しないファイル読み込みエラー: {e}")
             print(f"スタックトレース:\n{traceback.format_exc()}")
-            # 🔥 修正: エラー時もプログレスダイアログとオーバーレイを閉じる
             if hasattr(self.main_window, 'progress_dialog') and self.main_window.progress_dialog is not None:
                 self.main_window._close_progress_dialog()
             if hasattr(self.main_window, 'loading_overlay') and self.main_window.loading_overlay.isVisible():
@@ -188,18 +272,11 @@ class FileIOController(QObject):
             )
             QTimer.singleShot(0, self.main_window.view_controller.show_welcome_screen)
             self.main_window.file_loading_finished.emit()
-            self.main_window.async_manager.cleanup_backend_requested.emit() # エラー時もクリーンアップ
+            self.main_window.async_manager.cleanup_backend_requested.emit()
         finally:
-            pass # AsyncDataManagerが終了を通知するため、ここでは特に処理は不要
+            pass
         
         return None
-
-    # --- 以下のメソッドは AsyncDataManager にロジックが統合されたため削除 ---
-    # def _load_normal_file_with_progress(self, filepath, encoding):
-    #     pass
-
-    # def _finalize_file_load(self, data_object, filepath, encoding):
-    #     pass
 
     def _check_memory_feasibility(self, file_size_mb):
         """メモリ容量の事前チェック"""
@@ -218,13 +295,11 @@ class FileIOController(QObject):
             
         save_filepath = filepath
         
-        # filepathがNoneの場合、またはis_save_asがTrueの場合は、ファイル選択ダイアログを表示
         if save_filepath is None or is_save_as:
             save_filepath = self._get_save_filepath()
             if not save_filepath:
                 return False
         
-        # データが空の場合は保存不可
         if self.main_window.table_model.rowCount() == 0:
             QMessageBox.warning(self.main_window, "保存不可", 
                               "データが空のため保存できません.")
@@ -256,29 +331,13 @@ class FileIOController(QObject):
         print("DEBUG: FileIOController.save_as_with_dialog called")
         return self.save_file(is_save_as=True)
     
-    # ⭐ 新規作成機能を追加
     def create_new_file(self):
-        """新規CSVファイルを作成"""
+        """新規CSVファイルを作成（ウェルカム画面考慮版）"""
         print("DEBUG: FileIOController.create_new_file called.")
-        
-        # 既存のデータがある場合は確認
-        if self.main_window.table_model.rowCount() > 0:
-            if self.main_window.undo_manager.can_undo():
-                reply = QMessageBox.question(
-                    self.main_window,
-                    "確認",
-                    "未保存の変更があります。新規作成を続行しますか？",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                if reply == QMessageBox.No:
-                    return
         
         # 設定確認（ダイアログを表示するかどうか）
         show_dialog = self.main_window.settings_manager.get_show_new_file_dialog()
-        
         if show_dialog:
-            # 項目設定ダイアログを表示
             from dialogs import NewFileDialog
             dialog = NewFileDialog(self.main_window)
             if dialog.exec() != QDialog.Accepted:
@@ -288,44 +347,139 @@ class FileIOController(QObject):
             columns = result['columns']
             initial_rows = result['initial_rows']
         else:
-            # デフォルトの列構成
             columns = ['列1', '列2', '列3']
             initial_rows = 1
         
-        # 新規DataFrameを作成
+        # 新しいDataFrameを作成
         data = {}
         for col in columns:
             data[col] = [''] * initial_rows
+        new_df = pd.DataFrame(data)
         
-        df = pd.DataFrame(data)
+        print(f"DEBUG: 新規DataFrame作成 - shape: {new_df.shape}, columns: {list(new_df.columns)}")
         
-        # バックエンドをクリーンアップ
+        # 🔥 修正のポイント：ウェルカム画面の状態で分岐
+        if self._is_welcome_screen_active():
+            # ウェルカム画面の場合 → 既存ウィンドウで作成
+            print("DEBUG: ウェルカム画面状態のため、既存ウィンドウで新規作成します")
+            self._create_new_file_in_current_window(new_df)
+        else:
+            # 既にデータがある場合 → 新しいウィンドウで作成
+            print("DEBUG: 既存データがあるため、新しいウィンドウで新規作成します")
+            
+            # 未保存の変更確認 (新しいウィンドウで開く場合のみ確認)
+            if self.main_window.undo_manager.can_undo():
+                reply = QMessageBox.question(
+                    self.main_window,
+                    "確認",
+                    "現在のファイルに未保存の変更があります。\n"
+                    "新しいウィンドウで新規作成しますか？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.No:
+                    return
+            
+            # 新しいウィンドウで新規作成
+            # open_new_window_with_new_data には `_cleanup_backend` や `undo_manager.clear()` は不要です。
+            # 新しいウィンドウが初期化される際に、自動的にクリーンな状態が作られるためです。
+            self.main_window.open_new_window_with_new_data(new_df)
+
+    # 🔥 新規追加メソッド：現在のウィンドウで新規ファイルを作成する内部ヘルパー
+    def _create_new_file_in_current_window(self, new_df):
+        """現在のウィンドウのデータをリセットし、新規DataFrameで上書きする"""
+        print("DEBUG: 現在のウィンドウで新規ファイルを作成中...")
+        
+        # 🔥 重要：完全なクリーンアップ
+        self._complete_cleanup_for_new_file()
+        
+        # 🔥 重要：新しいDataFrameを設定
+        self._setup_new_dataframe(new_df)
+        
+        # UIの更新
+        self._update_ui_for_new_file(new_df)
+        
+        print("DEBUG: 現在のウィンドウでの新規ファイル作成完了")
+
+    def _complete_cleanup_for_new_file(self):
+        """新規ファイル作成のための完全なクリーンアップ"""
+        print("DEBUG: 完全クリーンアップ開始")
+        
+        # バックエンドのクリーンアップ
         self.main_window._cleanup_backend()
+        
+        # Undo/Redo履歴のクリア
         self.main_window.undo_manager.clear()
         
-        # 新規データを設定
-        self.main_window._df = df
-        self.main_window.header = list(df.columns)
-        self.main_window.filepath = None  # 未保存状態
-        self.main_window.encoding = 'shift_jis'  # デフォルトエンコーディング
+        # 検索ハイライトのクリア
+        if hasattr(self.main_window, 'search_controller'):
+            self.main_window.search_controller.clear_search_highlight()
+        
+        # ソート情報のクリア
+        self.main_window._clear_sort()
+        
+        # 🔥 重要：モデルのキャッシュをクリア
+        if hasattr(self.main_window.table_model, '_row_cache'):
+            self.main_window.table_model._row_cache.clear()
+        if hasattr(self.main_window.table_model, '_cache_queue'):
+            self.main_window.table_model._cache_queue.clear()
+        
+        # 🔥 重要：選択状態のクリア
+        self.main_window.table_view.clearSelection()
+        
+        print("DEBUG: 完全クリーンアップ完了")
+
+    def _setup_new_dataframe(self, new_df):
+        """新しいDataFrameをセットアップ"""
+        print("DEBUG: 新しいDataFrameのセットアップ開始")
+        
+        # メインウィンドウの状態を更新
+        self.main_window._df = new_df
+        self.main_window.header = list(new_df.columns)
+        self.main_window.filepath = None
+        self.main_window.encoding = 'shift_jis'
         self.main_window.performance_mode = False
         
-        # モデルとUIを更新
-        self.main_window.table_model.set_dataframe(df)
+        # 🔥 重要：モデルを完全にリセット
+        self.main_window.table_model.beginResetModel()
         
+        # 内部データを直接設定
+        self.main_window.table_model._dataframe = new_df
+        self.main_window.table_model._headers = list(new_df.columns)
+        self.main_window.table_model._backend = None
+        
+        # 検索ハイライトをクリア
+        self.main_window.table_model._search_highlight_indexes = set()
+        self.main_window.table_model._current_search_index = QModelIndex()
+        
+        self.main_window.table_model.endResetModel()
+        
+        print(f"DEBUG: モデル設定完了 - rowCount: {self.main_window.table_model.rowCount()}, "
+              f"columnCount: {self.main_window.table_model.columnCount()}")
+
+    def _update_ui_for_new_file(self, new_df):
+        """新規ファイル用にUIを更新"""
+        print("DEBUG: UI更新開始")
+        
+        # 検索パネルのヘッダー更新
         if self.main_window.search_panel:
             self.main_window.search_panel.update_headers(self.main_window.header)
         
+        # カードビューの再作成
         self.main_window.view_controller.recreate_card_view_fields()
-        self.main_window._clear_sort()
+        
+        # ビューの表示
         self.main_window.view_controller.show_main_view()
         
-        # ステータス更新
-        status_text = f"新規ファイル ({len(df):,}行, {len(df.columns)}列)"
+        # ステータスバーの更新
+        status_text = f"新規ファイル ({len(new_df):,}行, {len(new_df.columns)}列)"
         self.main_window.status_label.setText(status_text)
         self.main_window.setWindowTitle("高機能CSVエディタ (PySide6) - 無題")
         
+        # 操作メッセージ
         self.main_window.show_operation_status("新規ファイルを作成しました")
+        
+        # UI状態の設定
         self.main_window._set_ui_state('normal')
         
         # 最初のセルを選択
@@ -333,38 +487,33 @@ class FileIOController(QObject):
             first_index = self.main_window.table_model.index(0, 0)
             self.main_window.table_view.setCurrentIndex(first_index)
             self.main_window.table_view.scrollTo(first_index)
-            
+            self.main_window.table_view.setFocus()
+        
+        # 🔥 重要：ビューを強制的に更新
+        self.main_window.table_view.viewport().update()
+        QApplication.processEvents()
+        
+        print("DEBUG: UI更新完了")
+    
     def _load_file_data(self, filepath, encoding):
         """
         楽天CSV対応のファイル読み込み処理 (通常モード用)
-        このメソッドは AsyncDataManager にロジックが統合されたため、
-        現在のコードベースではほぼ使用されないか、最終的に削除されるべきです。
-        ここでは変更せず残します。
         """
         read_options = config.CSV_READ_OPTIONS.copy()
         read_options['encoding'] = encoding
         
-        # 楽天市場CSVの特殊な処理
         try:
-            # 巨大ファイル・多列対策
             with open(filepath, 'r', encoding=encoding) as f:
                 first_line = f.readline()
-                if first_line.count(',') > 100:  # 100列以上ある場合
-                    # Python エンジンでは low_memory は使えないので除外
-                    if read_options.get('engine') == 'python':
-                        # Python エンジンの場合は low_memory を設定しない
-                        pass
-                    else:
-                        # C エンジンの場合のみ low_memory を設定
+                if first_line.count(',') > 100:
+                    if read_options.get('engine') != 'python':
                         read_options['low_memory'] = False
         except Exception as e:
             print(f"WARNING: ファイルの先頭行読み込み中にエラー: {e}")
             pass
         
-        # CSVを読み込み
         df = pd.read_csv(filepath, **read_options)
         
-        # 楽天CSV後処理：全て文字列として扱う
         for col in df.columns:
             df[col] = df[col].fillna('').astype(str)
         
@@ -373,7 +522,6 @@ class FileIOController(QObject):
             
     def _detect_encoding(self, filepath):
         """エンコーディングを検出"""
-        # config.py の CSV_READ_OPTIONS['encoding'] を参照してデフォルトのエンコーディングリストを構築
         encodings_to_try = [
             'shift_jis',
             'cp932',
@@ -386,7 +534,7 @@ class FileIOController(QObject):
             try:
                 print(f"DEBUG: エンコーディング '{enc}' を試行中...")
                 with open(filepath, 'r', encoding=enc) as f:
-                    f.read(1024) # ファイルの冒頭を少量読み込んでデコードを試みる
+                    f.read(1024)
                 print(f"DEBUG: エンコーディング '{enc}' を使用")
                 return enc
             except UnicodeDecodeError:
@@ -403,7 +551,6 @@ class FileIOController(QObject):
         initial_dir = ""
         suggested_filename = ""
         
-        # main_windowのfilepathから初期パスを決定
         if self.main_window.filepath:
             if os.path.isabs(self.main_window.filepath):
                 initial_dir = os.path.dirname(self.main_window.filepath)
@@ -418,7 +565,7 @@ class FileIOController(QObject):
         initial_path = os.path.join(initial_dir, suggested_filename)
         
         filepath_tuple = QFileDialog.getSaveFileName(
-            self.main_window, # 親ウィジェット
+            self.main_window,
             "名前を付けて保存",
             initial_path,
             "CSVファイル (*.csv);;テキストファイル (*.txt);;すべてのファイル (*.*)"
@@ -429,7 +576,6 @@ class FileIOController(QObject):
             
         filepath = filepath_tuple[0]
         
-        # 拡張子がない場合は追加
         if not filepath.lower().endswith(('.csv', '.txt')):
             filepath += '.csv'
             
@@ -438,13 +584,11 @@ class FileIOController(QObject):
     def _perform_save(self, filepath, encoding, format_info):
         """実際の保存処理（楽天市場CSV対応版）"""
         try:
-            # プログレスダイアログ表示
             self.main_window._show_progress_dialog(
                 f"「{os.path.basename(filepath)}」を保存中...", None
             )
             
             if self.main_window.db_backend:
-                # SQLiteバックエンドの場合
                 def progress_callback(current, total):
                     self.main_window._update_progress_dialog(
                         "ファイルを保存中...", current, total
@@ -456,7 +600,6 @@ class FileIOController(QObject):
                     line_terminator=format_info['line_terminator']
                 )
             else:
-                # 通常のDataFrame保存（楽天市場対応）
                 df_to_save = self.main_window.table_model.get_dataframe()
                 if df_to_save is None or df_to_save.empty:
                     self.main_window._close_progress_dialog()
@@ -464,25 +607,22 @@ class FileIOController(QObject):
                                       "データが空のため保存できません.")
                     return False
                 
-                # 楽天市場向けのDataFrame準備
                 df_to_save = self._prepare_dataframe_for_rakuten(df_to_save, format_info)
                 
-                # 楽天市場向けの保存オプション
                 df_to_save.to_csv(
                     filepath,
                     index=False,
                     encoding=encoding,
                     quoting=format_info['quoting'],
-                    errors='replace', # エンコーディングエラー時の挙動
+                    errors='replace',
                     lineterminator=format_info['line_terminator'],
                     escapechar=None if format_info.get('preserve_html', True) else '\\',
-                    doublequote=True # クォート内のクォートは二重にする (CSV標準)
+                    doublequote=True
                 )
             
             self.main_window._close_progress_dialog()
             self.main_window.show_operation_status("ファイルを保存しました")
             
-            # 保存成功時にUndo履歴をクリア
             self.main_window.undo_manager.clear()
             self.main_window.update_menu_states()
 
@@ -508,11 +648,9 @@ class FileIOController(QObject):
         
         df_copy = df.copy()
         
-        # 文字列型に統一（NaNを空文字列に変換）
         for col in df_copy.columns:
             df_copy[col] = df_copy[col].fillna('').astype(str)
         
-        # HTMLタグの処理（preserve_htmlがFalseの場合のみエスケープ）
         if not format_info.get('preserve_html', True):
             print("DEBUG: HTMLタグをエスケープします。")
             for col in df_copy.columns:
@@ -522,7 +660,6 @@ class FileIOController(QObject):
         else:
             print("DEBUG: HTMLタグはそのまま保持します。")
             
-        # 改行の処理（preserve_linebreaksがFalseの場合のみ<br>タグに変換）
         if not format_info.get('preserve_linebreaks', True):
             print("DEBUG: セル内の改行を<br>タグに変換します。")
             for col in df_copy.columns:

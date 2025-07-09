@@ -325,7 +325,7 @@ class CsvTableModel(QAbstractTableModel):
                     self._row_cache.clear() # キャッシュクリア
                     self._cache_queue.clear() # キャッシュクリア
                 elif self._app_instance:
-                    self.show_operation_status("列の挿入に失敗しました。", is_error=True)
+                    self._app_instance.show_operation_status("列の挿入に失敗しました。", is_error=True)
                 
                 if self._app_instance:
                     self._app_instance.progress_bar.hide()
@@ -529,3 +529,18 @@ class CsvTableModel(QAbstractTableModel):
         self._row_cache.clear()
         self._cache_queue.clear()
         self.layoutChanged.emit()
+
+    def reset_to_empty(self):
+        """モデルを完全に空の状態にリセット"""
+        self.beginResetModel()
+        
+        # すべての内部状態をクリア
+        self._dataframe = pd.DataFrame()
+        self._headers = []
+        self._backend = None
+        self._search_highlight_indexes = set()
+        self._current_search_index = QModelIndex()
+        self._row_cache = {}
+        self._cache_queue.clear()
+        
+        self.endResetModel()
